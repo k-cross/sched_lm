@@ -1,0 +1,28 @@
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: llm-d-bench
+servers: 1
+agents: 0
+ports:
+  # Gateway port mapping
+  - port: 8080:80
+    nodeFilters:
+      - loadbalancer
+  # Gateway HTTPS
+  - port: 8443:443
+    nodeFilters:
+      - loadbalancer
+  # Prometheus node port (so we can access metrics from host)
+  - port: 9090:30090
+    nodeFilters:
+      - server:0
+options:
+  k3d:
+    wait: true
+  k3s:
+    extraArgs:
+      # Disable Traefik as we will use Gateway API with llm-d
+      - arg: "--disable=traefik"
+        nodeFilters:
+          - server:*

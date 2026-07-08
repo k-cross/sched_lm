@@ -1,0 +1,15 @@
+# Helm values for llm-d-router
+gateway:
+  name: "llmd-gateway"
+  namespace: "llm-d"
+
+epp:
+  resources:
+    limits:
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  config:
+    # We want to use ZMQ KV events for routing
+    enableKvEvents: true

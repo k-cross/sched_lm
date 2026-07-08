@@ -1,0 +1,44 @@
+[project]
+name = "llm-d-emulation-bench"
+version = "0.1.0"
+description = "Emulated vLLM Prefix-Caching Benchmark Harness using k3d, llm-d, and devenv"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp",
+    "prometheus-client",
+    "rich",
+    "click",
+    "pandas",
+    "numpy",
+]
+
+[project.scripts]
+bench = "bench.cli:main"
+
+[tool.uv]
+managed = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.15.20",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bench"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "C4", "UP"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
