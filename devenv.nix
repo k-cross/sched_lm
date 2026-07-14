@@ -72,11 +72,11 @@
   '';
 
   scripts."lint".exec = ''
-    uv run ruff check src/
+    uv run ruff check src/ tests/
   '';
 
   scripts."format".exec = ''
-    uv run ruff format src/
+    uv run ruff format src/ tests/
   '';
 
   # ── Shell Hook ──────────────────────────────────────────────────

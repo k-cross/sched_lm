@@ -99,19 +99,7 @@ Options: `--nodes`, `--sessions`, `--turns`, `--seed`, `--block-size`,
   (`--rag-zipf`, `--rag-doc-tokens`); one-shots are unique tokens, pure cache pollution.
   With a mixed workload the report adds a per-class breakdown (regret / p50 / hit rate).
 
-**Policies:** `weighted-precise` and `weighted-approx` replicate llm-d's shipped
-EPP pipeline — a saturation filter (drop nodes queued past a threshold;
-otherwise the shared prompt herds all traffic onto one node), then weighted
-scorers normalized to [0,1] (prefix affinity ×2, load ×1), argmax, no transfer
-arm. `precise` reads true node cache state; `approx` uses a router-side index of
-past decisions that never sees node-side evictions. Their regret gap splits the
-production pipeline's distance from the oracle into *information* (approx vs.
-precise) and *policy* (precise vs. oracle — the missing transfer arm).
-
-`class-aware` classifies each request from observables only (message shape and
-sizes — never the generator's ground-truth label): tool-session turns get
-transfer-aware scoring, RAG queries get doc-prefix affinity with saturation
-spill, one-shots go least-loaded (nothing to reuse, so never chase cache).
+**Policies:** See [`docs/policies.md`](docs/policies.md) for a detailed breakdown of the routing policies, their purpose, and their production readiness (Tier 0 to Tier 2).
 
 **Report columns:**
 
@@ -233,7 +221,6 @@ EPP against `llm-d-inference-sim`; not latency, the sims run no kernels) →
 uv run pytest
 uv run ruff check src/ tests/
 uv run ruff format src/ tests/
-uv check                       # type check (ty)
 ```
 
 ## Cleanup

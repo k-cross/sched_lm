@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 - Run Python CLI via `uv run`, never `python -m`: `uv run bench traffic|metrics|report ...` (entry point is `bench.cli:main`).
-- Lint: `uv run ruff check src/` — Format: `uv run ruff format src/`.
+- Lint: `uv run ruff check src/ tests/` — Format: `uv run ruff format src/ tests/`.
 - Cluster lifecycle (devenv scripts): `cluster-create`, `cluster-delete`, `cluster-status`, `deploy-monitoring`, `deploy-llmd`.
 
 ## Code style
@@ -22,7 +22,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Testing
 
-- No test suite exists yet. When adding non-trivial logic, add pytest tests alongside it (`uv add --dev pytest`, then `uv run pytest`). Don't scaffold a framework for trivial changes — `ruff check` is the baseline.
+- Run tests with `uv run pytest`. When adding non-trivial logic, add pytest tests in `tests/`. Don't scaffold a framework for trivial changes — `ruff check` is the baseline.
 
 ## Version control
 
