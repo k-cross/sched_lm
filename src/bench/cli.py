@@ -176,6 +176,23 @@ def report(
     generate_report(results, cache_hit_rates, prefill_times)
 
 
+def _parse_mix(ctx, param, value: str) -> dict[str, float]:
+    """Parse --mix 'tool=0.5,rag=0.3,oneshot=0.2' into a validated fraction dict."""
+    mix: dict[str, float] = {}
+    try:
+        for part in value.split(","):
+            name, _, frac = part.partition("=")
+            mix[name.strip()] = float(frac)
+    except ValueError as e:
+        raise click.BadParameter(f"expected name=frac[,name=frac...], got {value!r}") from e
+    unknown = set(mix) - {"tool", "rag", "oneshot"}
+    if unknown:
+        raise click.BadParameter(f"unknown classes {sorted(unknown)}; use tool, rag, oneshot")
+    if abs(sum(mix.values()) - 1.0) > 1e-6:
+        raise click.BadParameter(f"fractions must sum to 1, got {sum(mix.values()):g}")
+    return mix
+
+
 @main.command()
 @click.option(
     "--policy",
@@ -191,6 +208,24 @@ def report(
 @click.option("--tool-result-tokens", default=64, help="Tokens injected per tool result")
 @click.option("--think-time", default=2.0, help="Inter-turn think time (s)")
 @click.option("--qps", default=10.0, help="Aggregate target turn arrival rate")
+@click.option(
+    "--burst-cv",
+    default=1.0,
+    help="Coefficient of variation of session inter-arrivals: 1.0 = Poisson, >1 = bursty",
+)
+@click.option(
+    "--mix",
+    default="tool=1.0",
+    callback=_parse_mix,
+    help="Workload class fractions, e.g. tool=0.5,rag=0.3,oneshot=0.2 (must sum to 1)",
+)
+@click.option("--rag-docs", default=16, help="RAG retrieved-document pool size")
+@click.option("--rag-doc-tokens", default=1024, help="Tokens per RAG document")
+@click.option(
+    "--rag-zipf",
+    default=1.1,
+    help="RAG doc popularity skew (weight 1/rank^s); lower = flatter, no hot docs",
+)
 @click.option("--block-size", default=16, help="KV block size in tokens")
 @click.option("--bandwidth", default=4e9, help="KV-transfer interconnect bandwidth (bytes/s)")
 @click.option("--cache-blocks", default=2048, help="KV cache capacity per node, in blocks")
@@ -203,6 +238,11 @@ def simulate(
     tool_result_tokens,
     think_time,
     qps,
+    burst_cv,
+    mix,
+    rag_docs,
+    rag_doc_tokens,
+    rag_zipf,
     block_size,
     bandwidth,
     cache_blocks,
@@ -217,16 +257,25 @@ def simulate(
     from bench.sim.cost import CostParams
     from bench.sim.engine import run_simulation
     from bench.sim.policies import build_policy
-    from bench.sim.workload import generate_sessions
+    from bench.sim.workload import generate_mixed
 
     params = CostParams(block_size=block_size, bandwidth=bandwidth)
-    click.echo(f"Generating {sessions} sessions x {turns} turns (qps={qps}, seed={seed})...")
-    requests = generate_sessions(
+    mix_desc = ",".join(f"{k}={v:g}" for k, v in mix.items())
+    click.echo(
+        f"Generating {sessions} sessions x {turns} turns "
+        f"(qps={qps}, mix={mix_desc}, seed={seed})..."
+    )
+    requests = generate_mixed(
         sessions,
         turns,
         qps,
+        mix=mix,
+        rag_docs=rag_docs,
+        rag_doc_tokens=rag_doc_tokens,
+        rag_zipf=rag_zipf,
         tool_result_tokens=tool_result_tokens,
         think_time=think_time,
+        burst_cv=burst_cv,
         block_size=block_size,
         seed=seed,
     )

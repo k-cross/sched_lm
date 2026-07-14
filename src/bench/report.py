@@ -39,6 +39,26 @@ def generate_sim_report(results: dict):
 
     console.print(table)
 
+    # With a mixed workload, break the same runs down by ground-truth request class so
+    # class-blind vs class-aware policies can be compared where they actually differ.
+    kinds = sorted({k for res in results.values() for k in res.by_kind})
+    if len(kinds) > 1:
+        by_kind = Table(title="Per-class breakdown (regret s / TTFT p50 s / hit rate)")
+        by_kind.add_column("Policy", justify="left", style="cyan")
+        for kind in kinds:
+            by_kind.add_column(kind, justify="right")
+        for policy, res in results.items():
+            cells = []
+            for kind in kinds:
+                stats = res.by_kind.get(kind)
+                if stats is None:
+                    cells.append("-")
+                    continue
+                p50 = compute_percentiles(stats.ttfts).get(50, 0)
+                cells.append(f"{stats.mean_regret:.3f} / {p50:.3f} / {stats.hit_rate * 100:.0f}%")
+            by_kind.add_row(policy, *cells)
+        console.print(by_kind)
+
 
 def generate_report(results: dict, cache_hit_rates: dict, prefill_times: dict | None = None):
     prefill_times = prefill_times or {}

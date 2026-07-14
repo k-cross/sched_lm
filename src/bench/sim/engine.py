@@ -20,8 +20,39 @@ from dataclasses import dataclass, field
 
 from bench.sim.cost import CostParams, Placement, Regime, best_placement, hot_node, predict
 from bench.sim.node import Node
-from bench.sim.policies import Policy
+from bench.sim.policies import Policy, RequestView
 from bench.sim.workload import TurnRequest
+
+
+def request_view(req: TurnRequest) -> RequestView:
+    """Project a generated request down to what the router may observe (never ``kind``)."""
+    last = req.messages[-1]["content"] if req.messages else ""
+    return RequestView(
+        blocks=req.block_hashes,
+        prompt_tokens=len(req.tokens),
+        num_messages=len(req.messages),
+        has_tool_messages=any(m["role"] == "tool" for m in req.messages),
+        last_message_tokens=len(last.split()),
+    )
+
+
+@dataclass
+class KindStats:
+    """Per-workload-class slice of the aggregate metrics."""
+
+    count: int = 0
+    ttfts: list[float] = field(default_factory=list)
+    regrets: list[float] = field(default_factory=list)
+    reused_blocks: int = 0
+    total_blocks: int = 0
+
+    @property
+    def hit_rate(self) -> float:
+        return self.reused_blocks / self.total_blocks if self.total_blocks else 0.0
+
+    @property
+    def mean_regret(self) -> float:
+        return sum(self.regrets) / len(self.regrets) if self.regrets else 0.0
 
 
 @dataclass
@@ -35,6 +66,7 @@ class SimResult:
     coupled: int = 0
     reused_blocks: int = 0
     total_blocks: int = 0
+    by_kind: dict[str, KindStats] = field(default_factory=dict)
 
     @property
     def hit_rate(self) -> float:
@@ -59,14 +91,20 @@ def _resident(req_blocks: list[int], node: Node, transfer: bool, hot: Node) -> i
     return local + xfer
 
 
-def _is_coupled(req_blocks: list[int], nodes: list[Node], now: float, params: CostParams) -> bool:
+def _is_coupled(
+    req_blocks: list[int],
+    nodes: list[Node],
+    now: float,
+    params: CostParams,
+    loaded: Placement,
+) -> bool:
     """True if the optimal placement changes once the cluster's queues are emptied.
 
-    We compare the oracle decision under the real queue state against the decision with
-    every node forced idle (waits zeroed, caches kept). If they differ, this request's
-    optimal placement depends on *other* nodes' load -- it is not independent of them.
+    We compare the oracle decision under the real queue state (``loaded``, already computed
+    by the caller) against the decision with every node forced idle (waits zeroed, caches
+    kept). If they differ, this request's optimal placement depends on *other* nodes' load
+    -- it is not independent of them.
     """
-    loaded = best_placement(req_blocks, nodes, now, params)
     saved = [n.busy_until for n in nodes]
     for n in nodes:
         n.busy_until = now  # wait() -> 0 for all nodes
@@ -93,10 +131,10 @@ def run_simulation(
         now = req.arrival
 
         oracle_p = best_placement(blocks, nodes, now, params)
-        if _is_coupled(blocks, nodes, now, params):
+        if _is_coupled(blocks, nodes, now, params, oracle_p):
             result.coupled += 1
 
-        chosen: Placement = policy(blocks, nodes, now, params)
+        chosen: Placement = policy(request_view(req), nodes, now, params)
 
         # Recompute the chosen placement's true cost on the real state: an approximate
         # policy must be charged what its decision actually costs, not what it guessed.
@@ -104,15 +142,23 @@ def run_simulation(
         node = nodes[chosen.node_id]
         realized = predict(blocks, node, now, params, hot, transfer=chosen.transfer)
 
+        regret = max(0.0, realized.ttft - oracle_p.ttft)
         result.ttfts.append(realized.ttft)
         result.e2e_latencies.append(realized.ttft + req.gen_tokens * params.inter_token)
         result.regimes[realized.regime] += 1
-        result.regrets.append(max(0.0, realized.ttft - oracle_p.ttft))
+        result.regrets.append(regret)
         result.successes += 1
 
         resident = _resident(blocks, node, chosen.transfer, hot)
         result.reused_blocks += resident
         result.total_blocks += len(blocks)
+
+        kind = result.by_kind.setdefault(req.kind, KindStats())
+        kind.count += 1
+        kind.ttfts.append(realized.ttft)
+        kind.regrets.append(regret)
+        kind.reused_blocks += resident
+        kind.total_blocks += len(blocks)
 
         missing = len(blocks) - resident
         service = params.prefill_time(missing) + req.gen_tokens * params.inter_token

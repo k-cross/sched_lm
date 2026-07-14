@@ -18,7 +18,7 @@ class MetricsClient:
     async def _scalar(self, query_str: str) -> float:
         """Run an instant query expected to return a single scalar value."""
         results = await self.query(query_str)
-        if results and len(results) > 0:
+        if results:
             value = results[0].get("value", [0, "0"])[1]
             try:
                 return float(value)
