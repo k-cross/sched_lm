@@ -108,7 +108,8 @@ Options: `--nodes`, `--sessions`, `--turns`, `--seed`, `--block-size`,
 | TTFT p50/p99 | Predicted time-to-first-token. |
 | Hit rate | Prefix blocks served from cache vs. recomputed. |
 | Regime | % of requests resolved by wait / transfer / recompute. |
-| Regret (s) | Mean `policy_TTFT − oracle_TTFT`; 0 for the oracle. |
+| Routing regret (s) | Mean `policy_TTFT − oracle_TTFT` on the policy's *own* cache state. Measures routing quality only; 0 for both `oracle` and `oracle-belady`. |
+| TTFT gap (s) | `policy_p50 − oracle-belady_p50`; how far a policy's aggregate latency is from the theoretical best (a single comparable baseline for every row). |
 | Coupled | % of requests whose optimal placement changes once every *other* node is forced idle — how much a decision depends on cluster-wide state. |
 
 Sweep `--qps` and `--bandwidth`: regret and coupled fraction climb with

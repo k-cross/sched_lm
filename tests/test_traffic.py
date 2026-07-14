@@ -1,14 +1,13 @@
 import asyncio
 import time
 
-from bench.traffic import (
+from bench.prompt import (
     _CHARS_PER_TOKEN,
-    ROUTE_HEADER,
     SYSTEM_PROMPT,
     SYSTEM_PROMPT_TARGET_TOKENS,
     _build_system_prompt,
-    run_traffic,
 )
+from bench.traffic import ROUTE_HEADER, run_traffic
 
 
 def test_system_prompt_is_deterministic_and_shared():

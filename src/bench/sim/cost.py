@@ -68,6 +68,11 @@ class Placement:
     transfer: bool
     regime: Regime
     ttft: float
+    # Soft-pin expiry a policy may set to keep the chosen node's copy of this request's
+    # prefix warm until the session is predicted to return. 0.0 = no retention (pure LRU).
+    # Meaningful only on a policy's *returned* placement; the cost candidates from
+    # ``predict``/``best_placement`` always leave it 0.0.
+    retain_until: float = 0.0
 
 
 def hot_node(req_blocks: list[int], nodes: list[Node]) -> Node:

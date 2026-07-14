@@ -1,16 +1,35 @@
+import statistics
+from typing import TYPE_CHECKING
+
 from rich.console import Console
 from rich.table import Table
 
+if TYPE_CHECKING:
+    from bench.sim.engine import SimResult
 
-def generate_sim_report(results: dict):
+
+def generate_sim_report(results: "dict[str, SimResult]"):
     """Render the offline-simulator policy comparison.
 
     ``results`` maps a policy name to a ``bench.sim.engine.SimResult``. Unlike the live
     report, this surfaces the sim-only signals: the regime mix (how often each of the three
-    routing regimes was chosen), mean regret vs. the oracle, and the coupled fraction (how
+    routing regimes was chosen), routing regret, TTFT gap, and the coupled fraction (how
     often the optimal placement depended on other nodes' load).
+
+    **Routing regret** is per-policy: each request's TTFT minus the greedy-oracle TTFT on
+    that same simulation's node state. It measures how well the policy *routes* given its
+    own cache contents — not how good those cache contents are. Both ``oracle`` and
+    ``oracle-belady`` show 0.000 because they both route optimally on their own state.
+
+    **TTFT gap** is cross-policy: each policy's p50 TTFT minus the best oracle baseline's
+    p50 (``oracle-belady`` if run, else ``oracle``). It is the comparable measure of how far
+    a policy is from that reference. ``oracle-belady`` is a strong *estimate* of the best
+    achievable, not a proven bound (its Belady eviction is approximate under multi-node
+    routing), so a policy with better cache management can post a small **negative** gap --
+    read that as "faster than the reference baseline," not an impossibility.
     """
     from bench.metrics import compute_percentiles
+    from bench.sim.policies import ORACLE_BASELINES
 
     console = Console()
     table = Table(title="Offline Prefix-Cache Routing Simulation")
@@ -20,20 +39,30 @@ def generate_sim_report(results: dict):
     table.add_column("TTFT p99 (s)", justify="right", style="red")
     table.add_column("Hit rate", justify="right", style="blue")
     table.add_column("Regime (wait/xfer/recomp)", justify="center", style="green")
-    table.add_column("Regret (s)", justify="right", style="magenta")
+    table.add_column("Routing regret (s)", justify="right", style="magenta")
+    table.add_column("TTFT gap (s)", justify="right", style="magenta")
     table.add_column("Coupled", justify="right", style="magenta")
 
+    # Compute each policy's percentiles once, then read the best-available oracle baseline
+    # for the cross-policy TTFT gap column from that same table.
+    pctiles = {policy: compute_percentiles(res.ttfts) for policy, res in results.items()}
+    best_oracle = next((n for n in ORACLE_BASELINES if n in results), None)
+    baseline_p50 = pctiles[best_oracle].get(50, 0) if best_oracle is not None else None
+
     for policy, res in results.items():
-        ttfts = compute_percentiles(res.ttfts)
+        ttfts = pctiles[policy]
         mix = res.regime_mix
         mean_regret = sum(res.regrets) / len(res.regrets) if res.regrets else 0.0
+        p50 = ttfts.get(50, 0)
+        gap = f"{p50 - baseline_p50:.3f}" if baseline_p50 is not None else "-"
         table.add_row(
             policy,
-            f"{ttfts.get(50, 0):.3f}",
+            f"{p50:.3f}",
             f"{ttfts.get(99, 0):.3f}",
             f"{res.hit_rate * 100:.1f}%",
             f"{mix['wait'] * 100:.0f}/{mix['transfer'] * 100:.0f}/{mix['recompute'] * 100:.0f}",
             f"{mean_regret:.3f}",
+            gap,
             f"{res.coupled_fraction * 100:.1f}%",
         )
 
@@ -59,8 +88,28 @@ def generate_sim_report(results: dict):
             by_kind.add_row(policy, *cells)
         console.print(by_kind)
 
+    # If the workload modeled tool reliability, show the per-tool re-arrival-gap distribution
+    # the reliability-aware policy learns from (mean + std -> which tools are worth keeping
+    # cache warm for). It is policy-independent, so take it from any run that has it.
+    gap_by_tool = next((res.gap_by_tool for res in results.values() if res.gap_by_tool), None)
+    if gap_by_tool:
+        tools = Table(title="Observed re-arrival gap per tool (s)")
+        tools.add_column("Tool", justify="left", style="cyan")
+        tools.add_column("Calls", justify="right")
+        tools.add_column("Mean gap", justify="right", style="yellow")
+        tools.add_column("Std gap", justify="right", style="red")
+        for tool in sorted(gap_by_tool):
+            gaps = gap_by_tool[tool]
+            std = statistics.pstdev(gaps) if len(gaps) > 1 else 0.0
+            tools.add_row(tool, str(len(gaps)), f"{statistics.mean(gaps):.2f}", f"{std:.2f}")
+        console.print(tools)
 
-def generate_report(results: dict, cache_hit_rates: dict, prefill_times: dict | None = None):
+
+def generate_report(
+    results: dict[str, dict[str, float]],
+    cache_hit_rates: dict[str, float],
+    prefill_times: dict[str, float | None] | None = None,
+):
     prefill_times = prefill_times or {}
     console = Console()
     table = Table(title="Emulated Prefix-Caching Benchmark Results")

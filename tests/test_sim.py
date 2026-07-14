@@ -4,17 +4,20 @@ from collections import Counter
 from bench.sim.blocks import hash_blocks, matched_prefix
 from bench.sim.cost import CostParams, Regime, best_placement, hot_node, predict
 from bench.sim.engine import _is_coupled, request_view, run_simulation
-from bench.sim.node import Node
+from bench.sim.node import BeladyNode, Node
 from bench.sim.policies import (
     POLICY_NAMES,
+    ClassAwareReliability,
     RequestView,
+    ToolGapIndex,
     build_policy,
     cache_local,
     class_aware,
     classify,
     oracle,
+    uses_belady,
 )
-from bench.sim.workload import generate_mixed, generate_sessions
+from bench.sim.workload import Tool, TurnRequest, generate_mixed, generate_sessions
 
 BLOCK = 4
 
@@ -212,7 +215,7 @@ def test_burstier_arrivals_have_higher_gap_variability():
 
 def test_turn_prefix_grows_within_session():
     requests = generate_sessions(3, turns=5, qps=100.0, block_size=BLOCK, seed=1)
-    by_session: dict[int, list] = {}
+    by_session: dict[int, list[TurnRequest]] = {}
     for r in requests:
         by_session.setdefault(r.session_id, []).append(r)
     for turns in by_session.values():
@@ -371,3 +374,263 @@ def test_per_kind_stats_sum_to_aggregates():
     assert sum(len(k.regrets) for k in res.by_kind.values()) == len(res.regrets)
     assert sum(k.reused_blocks for k in res.by_kind.values()) == res.reused_blocks
     assert sum(k.total_blocks for k in res.by_kind.values()) == res.total_blocks
+
+
+# --- tool-reliability workload -----------------------------------------------
+
+
+def test_tool_reliability_off_reproduces_the_plain_stream():
+    # The new modeling must be strictly opt-in: default args are byte-for-byte identical.
+    a = generate_sessions(12, turns=4, qps=6.0, block_size=BLOCK, seed=4)
+    b = generate_sessions(12, turns=4, qps=6.0, block_size=BLOCK, seed=4, tool_reliability=False)
+    assert [(r.arrival, r.block_hashes, r.tool_name) for r in a] == [
+        (r.arrival, r.block_hashes, r.tool_name) for r in b
+    ]
+    assert all(r.tool_name is None for r in a)  # no tool signal without the flag
+
+
+def test_tool_reliability_is_deterministic_and_labels_turns():
+    reqs = generate_sessions(8, turns=4, qps=6.0, block_size=BLOCK, seed=4, tool_reliability=True)
+    again = generate_sessions(8, turns=4, qps=6.0, block_size=BLOCK, seed=4, tool_reliability=True)
+    assert [(r.arrival, r.block_hashes) for r in reqs] == [
+        (r.arrival, r.block_hashes) for r in again
+    ]
+    for r in reqs:
+        # Turn 0 has no prior tool call; every later turn names the session's tool.
+        assert (r.tool_name is None) == (r.turn_idx == 0)
+        assert r.conversation_id == r.session_id
+
+
+def test_failed_calls_stay_short_and_reliable_calls_are_long():
+    # A tool that always fails: every inter-turn gap is the short retry gap.
+    flaky = [Tool("flaky", fail_prob=1.0, success_latency=99.0)]
+    reqs = generate_sessions(
+        1, turns=5, qps=100.0, block_size=BLOCK, seed=1, tool_reliability=True, tools=flaky
+    )
+    reqs.sort(key=lambda r: r.turn_idx)
+    gaps = [b.arrival - a.arrival for a, b in zip(reqs, reqs[1:], strict=False)]
+    assert all(abs(g - 0.2) < 1e-9 for g in gaps)  # _DEFAULT_RETRY_GAP
+
+
+def test_reliable_tool_is_lower_variance_than_coin_flip():
+    def gap_std(tool: Tool) -> float:
+        reqs = generate_sessions(
+            60, turns=4, qps=100.0, block_size=BLOCK, seed=2, tool_reliability=True, tools=[tool]
+        )
+        by_sess: dict[int, list[TurnRequest]] = {}
+        for r in reqs:
+            by_sess.setdefault(r.session_id, []).append(r)
+        gaps = []
+        for turns in by_sess.values():
+            turns.sort(key=lambda r: r.turn_idx)
+            gaps += [b.arrival - a.arrival for a, b in zip(turns, turns[1:], strict=False)]
+        return statistics.pstdev(gaps)
+
+    steady = Tool("steady", fail_prob=0.0, success_latency=1.0)
+    coinflip = Tool("coinflip", fail_prob=0.5, success_latency=10.0)
+    assert gap_std(steady) < gap_std(coinflip)
+
+
+# --- ToolGapIndex ------------------------------------------------------------
+
+
+def test_gap_index_learns_mean_and_confidence():
+    idx = ToolGapIndex(alpha=0.5)
+    for _ in range(20):
+        idx.record("t", 1.0)  # perfectly consistent
+    mean, var = idx.predict("t")
+    assert abs(mean - 1.0) < 1e-6
+    assert var < 1e-6
+    assert idx.confidence("t") > 0.99
+
+    for g in (0.1, 5.0, 0.1, 5.0, 0.1, 5.0):  # bimodal -> high variance
+        idx.record("bimodal", g)
+    assert idx.confidence("bimodal") < idx.confidence("t")
+
+
+def test_gap_index_capacity_falls_back_to_prior():
+    idx = ToolGapIndex(capacity=1, priors={"known": (0.5, 0.01)}, default_prior=(9.0, 81.0))
+    idx.record("known", 4.0)  # learned value present...
+    idx.record("other", 4.0)  # ...but capacity=1 evicts "known"
+    # Evicted tool falls back to its static prior, not the learned 4.0.
+    assert idx.predict("known") == (0.5, 0.01)
+    # Never-seen tool with no prior -> global default.
+    assert idx.predict("mystery") == (9.0, 81.0)
+
+
+# --- node cache-retention ----------------------------------------------------
+
+
+def test_retain_until_protects_prefix_from_eviction():
+    node = Node(0, cache_blocks=3)
+    node.admit(0.0, 1.0, [1, 2, 3], retain_until=100.0)  # pin these
+    # New blocks arrive unprotected; the protected ones must survive, evicting the newcomers.
+    node.admit(1.0, 1.0, [4, 5, 6])
+    assert node.matched([1, 2, 3]) == 3
+    assert node.matched([4, 5, 6]) == 0
+
+
+def test_expired_retention_evicts_like_lru():
+    node = Node(0, cache_blocks=3)
+    node.admit(0.0, 1.0, [1, 2, 3], retain_until=5.0)
+    # By now=10 the pin has expired, so pressure evicts the old blocks as usual.
+    node.admit(10.0, 1.0, [4, 5, 6])
+    assert node.matched([1, 2, 3]) == 0
+    assert node.matched([4, 5, 6]) == 3
+
+
+def test_unprotected_readmit_clears_stale_pin():
+    # Re-admitting a pinned block without protection must drop the old pin, so the default
+    # retain_until=0.0 path reproduces pure LRU (block 1 is no longer shielded).
+    node = Node(0, cache_blocks=2)
+    node.admit(0.0, 1.0, [1], retain_until=100.0)
+    node.admit(1.0, 1.0, [1])  # re-admit unprotected -> pin cleared
+    # Fill the cache so block 1 must compete on pure recency; it is now the LRU, so it goes.
+    node.admit(2.0, 1.0, [2, 3])
+    assert node.matched([1]) == 0
+    assert node.matched([2, 3]) == 2
+
+
+def test_all_pinned_evicts_soonest_expiring():
+    # When every resident block is still protected, eviction should sacrifice the pin that
+    # expires soonest, not the strict-LRU block (which here is pinned far longer).
+    node = Node(0, cache_blocks=2)
+    node.admit(0.0, 1.0, [1], retain_until=100.0)  # LRU-oldest, but pinned longest
+    node.admit(1.0, 1.0, [2], retain_until=10.0)  # expires soonest
+    node.admit(2.0, 1.0, [3], retain_until=100.0)  # overflow at now=2, all still pinned
+    assert node.matched([2]) == 0  # soonest-expiring pin sacrificed
+    assert node.matched([1]) == 1  # longer-lived pin kept despite being LRU-oldest
+    assert node.matched([3]) == 1
+
+
+# --- class-aware-reliability policy ------------------------------------------
+
+
+def _tool_view(blocks, *, conversation_id, last_tool_name):
+    return RequestView(
+        blocks=blocks,
+        prompt_tokens=len(blocks) * BLOCK,
+        num_messages=4,
+        has_tool_messages=True,  # -> classify() == "tool"
+        last_message_tokens=6,
+        conversation_id=conversation_id,
+        last_tool_name=last_tool_name,
+    )
+
+
+def test_reliability_policy_in_registry():
+    assert "class-aware-reliability" in POLICY_NAMES
+    assert isinstance(build_policy("class-aware-reliability"), ClassAwareReliability)
+
+
+def test_reliability_policy_retains_for_confident_fast_tool():
+    params = CostParams(block_size=BLOCK)
+    nodes = _nodes(n=2)
+    policy = ClassAwareReliability()
+    blocks = [1, 2, 3, 4]
+    # Drive one conversation returning every 0.3s after calling "fast": the policy learns a
+    # short, low-variance gap and should soft-pin the prefix on the last turn.
+    last = None
+    for k in range(6):
+        last = policy(
+            _tool_view(blocks, conversation_id=7, last_tool_name="fast"), nodes, k * 0.3, params
+        )
+    assert last is not None and last.retain_until > 6 * 0.3  # keep-warm window into the future
+
+
+def test_reliability_policy_no_retention_for_unknown_tool():
+    params = CostParams(block_size=BLOCK)
+    nodes = _nodes(n=2)
+    policy = ClassAwareReliability()
+    # An unseen tool falls back to the low-confidence default prior -> no retention gamble.
+    p = policy(
+        _tool_view([1, 2, 3, 4], conversation_id=1, last_tool_name="brand_new"), nodes, 0.0, params
+    )
+    assert p.retain_until == 0.0
+
+
+def test_reliability_policy_beats_class_aware_on_tool_hit_rate():
+    # Under cache pressure, keeping fast-returning sessions' prefixes warm should lift the
+    # tool-class cross-turn hit rate versus plain class-aware on the same stream.
+    requests = generate_mixed(
+        60, 5, 40.0, mix={"tool": 1.0}, block_size=BLOCK, tool_reliability=True, seed=21
+    )
+    params = CostParams(block_size=BLOCK)
+    base = run_simulation(requests, build_policy("class-aware"), 3, 60, params)
+    rel = run_simulation(requests, build_policy("class-aware-reliability"), 3, 60, params)
+    assert rel.by_kind["tool"].hit_rate >= base.by_kind["tool"].hit_rate
+    # And the workload exposed a per-tool gap distribution to learn from.
+    assert rel.gap_by_tool
+
+
+# --- Belady's MIN eviction / oracle-belady ------------------------------------
+
+
+def test_belady_retains_soon_needed_block_that_lru_evicts():
+    # Cache capacity=3. Admit blocks [1,2,3], then [4,5,6]. LRU evicts 1,2,3 entirely.
+    # With Belady, if block 1 is needed again at request index 2 but blocks 4,5,6 are
+    # never needed again, Belady keeps 1 and evicts one of {4,5,6} instead.
+    future_uses: dict[int, list[int]] = {
+        1: [0, 2],  # block 1 used at request 0 and again at request 2
+        2: [0],  # block 2 used only at request 0
+        3: [0],  # block 3 used only at request 0
+        4: [1],  # block 4 used only at request 1
+        5: [1],  # block 5 used only at request 1
+        6: [1],  # block 6 used only at request 1
+    }
+    node = BeladyNode(0, cache_blocks=3, future_uses=future_uses)
+    node.admit(0.0, 1.0, [1, 2, 3], at_index=0)
+    assert node.matched([1, 2, 3]) == 3
+
+    node.admit(1.0, 1.0, [4, 5, 6], at_index=1)
+    # Belady should have kept block 1 (needed at request 2) and evicted 2 and 3 (never
+    # needed again) plus one of {4,5,6} that was just admitted but has no future use.
+    # After admitting [4,5,6], we have 6 blocks total vs capacity 3 -> 3 evictions.
+    # Eviction order: blocks 2,3 (next use inf) then the furthest-future of {1,4,5,6}.
+    # Block 1 has next use at index 2; blocks 4,5,6 have next use inf (their only use was
+    # the current request 1, and bisect_right(1, 1) -> past the end). So 4,5,6 get evicted
+    # after 2,3, but we only need 3 evictions total: evict 2, 3, and one of {4,5,6} that
+    # has inf next use.
+    # Result: block 1 survives.
+    assert 1 in node.cache
+
+
+def test_belady_evicts_like_lru_when_no_future_knowledge():
+    # When every block's future uses list is empty (or absent), Belady degrades to
+    # always-evict-first-candidate (all have inf next use), which still frees space.
+    node = BeladyNode(0, cache_blocks=3, future_uses={})
+    node.admit(0.0, 1.0, [1, 2, 3], at_index=0)
+    node.admit(1.0, 1.0, [4, 5, 6], at_index=1)
+    # All old blocks have inf next use, so all three are evicted.
+    assert node.matched([1, 2, 3]) == 0
+    assert node.matched([4, 5, 6]) == 3
+
+
+def test_oracle_belady_in_registry():
+    assert "oracle-belady" in POLICY_NAMES
+    # oracle-belady reuses the oracle routing function; the eviction difference is carried
+    # by uses_belady(), the single source of truth the CLI/report consult.
+    assert build_policy("oracle-belady") is oracle
+    assert uses_belady("oracle-belady") and not uses_belady("oracle")
+
+
+def test_oracle_belady_regret_is_zero():
+    # Like the LRU oracle, oracle-belady routes optimally on current state so per-request
+    # regret vs. itself must be ~0. (Belady only changes eviction, not routing.)
+    requests = generate_sessions(30, turns=4, qps=8.0, block_size=BLOCK, seed=3)
+    params = CostParams(block_size=BLOCK)
+    res = run_simulation(requests, build_policy("oracle-belady"), 3, 500, params, belady=True)
+    assert max(res.regrets) < 1e-9
+
+
+def test_oracle_belady_hit_rate_ge_oracle_lru():
+    # Empirical (not construction-guaranteed): with a global, routing-agnostic future-use
+    # map and a contiguous-prefix hit metric, Belady's MIN is only an approximation, so this
+    # >= holds for this fixed seed rather than for all workloads. See docs/policies.md.
+    requests = generate_mixed(
+        60, 5, 40.0, mix={"tool": 1.0}, block_size=BLOCK, tool_reliability=True, seed=21
+    )
+    params = CostParams(block_size=BLOCK)
+    lru = run_simulation(requests, build_policy("oracle"), 3, 60, params)
+    bel = run_simulation(requests, build_policy("oracle-belady"), 3, 60, params, belady=True)
+    assert bel.hit_rate >= lru.hit_rate - 1e-9

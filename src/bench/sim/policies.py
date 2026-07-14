@@ -21,6 +21,10 @@ to transfer, and the regime that realizes). They differ only in the *choice set*
     sizes -- never the workload's ground-truth label) into tool-session / RAG / one-shot
     and applies a different strategy per class: transfer-aware for session turns, doc-prefix
     affinity with saturation spill for RAG, least-loaded for one-shots (never chase cache).
+  * ``class_aware_reliability`` -- ``class_aware`` plus a per-tool re-arrival-gap estimate
+    (learned from timing alone, never success/failure): a tool-session turn whose last tool
+    call confidently predicts a short return soft-pins its prefix on the chosen node so it
+    survives eviction until the session comes back.
   * ``oracle``        -- argmin over (node, transfer) with perfect current state. The lower
     bound every other policy's regret is measured against.
 
@@ -57,6 +61,12 @@ class RequestView:
     has_tool_messages: bool = False
     last_message_tokens: int = 0
     label: str = field(default="unknown", compare=False)
+    # Timing-observable signals for the reliability-aware policy: a session/affinity header
+    # and the most recent tool call in the history. Both are body/header-derivable and never
+    # carry the latent success/failure outcome. ``compare=False`` keeps view identity
+    # (used as a cache key in tests) independent of them.
+    conversation_id: int | None = field(default=None, compare=False)
+    last_tool_name: str | None = field(default=None, compare=False)
 
 
 # A RAG query embeds a retrieved document in its user message; a session's opening user
@@ -165,6 +175,119 @@ class _RouterIndex:
             index.popitem(last=False)
 
 
+@dataclass
+class GapStat:
+    """Online estimate of a tool's re-arrival gap: EWMA mean and variance."""
+
+    count: int = 0
+    mean: float = 0.0
+    var: float = 0.0
+
+
+class ToolGapIndex:
+    """Per-tool re-arrival-gap estimates, learned from timing alone.
+
+    Mirrors the cheap, bounded bookkeeping a real gateway could keep: one small table keyed
+    by tool signature, each entry an EWMA of the observed inter-turn gap's mean and variance.
+    It never sees success/failure -- only the realized gap between a conversation's
+    consecutive turns -- so it works from pure timing metadata.
+
+    The table is capacity-bounded (an LRU); tools that fall off, and tools never yet seen,
+    fall back to a static ``priors`` map, then a global ``default_prior``. That bound is the
+    memory/compute guard: cost is hard-capped regardless of how many distinct tools appear.
+    """
+
+    def __init__(
+        self,
+        capacity: int = 512,
+        alpha: float = 0.3,
+        priors: dict[str, tuple[float, float]] | None = None,
+        # High variance relative to the mean -> low confidence, so an unseen tool does not
+        # trigger retention until it has actually been observed.
+        default_prior: tuple[float, float] = (2.0, 16.0),
+    ) -> None:
+        self._capacity = capacity
+        self._alpha = alpha
+        self._priors = dict(priors) if priors else {}
+        self._default_prior = default_prior
+        self._stats: OrderedDict[str, GapStat] = OrderedDict()
+
+    def record(self, tool: str, gap: float) -> None:
+        """Fold one observed gap into the tool's EWMA mean and variance."""
+        stat = self._stats.pop(tool, None)
+        if stat is None:
+            stat = GapStat()
+        if stat.count == 0:
+            stat.mean = gap
+            stat.var = 0.0
+        else:
+            delta = gap - stat.mean
+            stat.mean += self._alpha * delta
+            # EWMA of squared deviation from the (pre-update) mean -- a standard online
+            # variance tracker that needs only the running mean, no second pass.
+            stat.var = (1 - self._alpha) * (stat.var + self._alpha * delta * delta)
+        stat.count += 1
+        self._stats[tool] = stat  # reinsert as most-recently-used
+        while len(self._stats) > self._capacity:
+            self._stats.popitem(last=False)
+
+    def predict(self, tool: str | None) -> tuple[float, float]:
+        """Best (mean, variance) estimate: learned stat, else prior, else default."""
+        if tool is not None:
+            stat = self._stats.get(tool)
+            if stat is not None:  # any stored stat has been recorded at least once
+                return stat.mean, stat.var
+            if tool in self._priors:
+                return self._priors[tool]
+        return self._default_prior
+
+    def confidence(self, tool: str | None) -> float:
+        """Inverse-variance weight in [0, 1]: high for consistent (low-variance) tools."""
+        return gap_confidence(*self.predict(tool))
+
+
+def gap_confidence(mean: float, var: float) -> float:
+    """Inverse-variance weight in [0, 1] for a (mean, variance) gap estimate.
+
+    Normalized against the mean so it is scale-free -- a tool whose gap varies little
+    relative to its mean is trusted; a bimodal fast/slow tool is not.
+    """
+    scale = max(mean * mean, 1e-9)
+    return 1.0 / (1.0 + var / scale)
+
+
+# Bound on the per-conversation last-seen table used to measure re-arrival gaps. Like every
+# other router-side table here it is capacity-capped so memory stays O(active conversations),
+# not O(all conversations ever) -- single-turn RAG/one-shot ids fall out under the LRU.
+GAP_TRACKER_CAPACITY = 8192
+
+
+def observe_gap(
+    last_seen: "OrderedDict[int, float]",
+    conversation_id: int | None,
+    tool: str | None,
+    now: float,
+    capacity: int = GAP_TRACKER_CAPACITY,
+) -> float | None:
+    """Realized re-arrival gap since this conversation's previous turn, or None.
+
+    Records ``now`` as the conversation's latest turn in a bounded LRU and returns the gap to
+    attribute to ``tool`` (the tool whose result now sits in the history). Returns None when
+    there is nothing learnable: no conversation link, no prior turn, or no tool yet (turn 0 --
+    which still updates ``last_seen`` so the next turn's gap can be measured).
+    """
+    if conversation_id is None:
+        return None
+    prev = last_seen.get(conversation_id)
+    last_seen[conversation_id] = now
+    last_seen.move_to_end(conversation_id)
+    while len(last_seen) > capacity:
+        last_seen.popitem(last=False)
+    if prev is None or tool is None:
+        return None
+    return now - prev
+
+
 class WeightedScorers:
     """llm-d EPP-style filter-then-score pipeline; never transfers, like production llm-d.
 
@@ -263,11 +386,80 @@ def class_aware(req: RequestView, nodes: list[Node], now: float, params: CostPar
     return transfer_aware(req, nodes, now, params)
 
 
+# A predicted return within this many seconds, at this confidence, is worth keeping the
+# prefix warm for; slower or less-certain returns are not (the cache would be better spent
+# on other traffic).
+DEFAULT_SHORT_GAP = 3.0
+DEFAULT_CONF_THRESHOLD = 0.5
+DEFAULT_RETAIN_MARGIN = 1.5
+
+
+class ClassAwareReliability:
+    """``class_aware`` plus a learned re-arrival-gap signal for tool sessions.
+
+    Routing is the same class-conditioned logic as :func:`class_aware`. The addition is a
+    :class:`ToolGapIndex` that learns, per tool signature, how soon a session tends to return
+    after calling it -- from timing alone (the realized gap between a conversation's turns),
+    never from the tool's success/failure.
+
+    When a tool-session turn is routed and its most recent tool call **confidently** predicts
+    a **short** return (low-variance, short-mean), the chosen node's copy of this prefix is
+    soft-pinned (``retain_until``) so it survives eviction until the session comes back --
+    turning what would have been a recompute into a cheap cache hit. A long predicted gap, or
+    an unpredictable (high-variance) or unseen tool, adds no retention: the router does not
+    gamble cache on an unreliable prediction.
+    """
+
+    def __init__(
+        self,
+        index: ToolGapIndex | None = None,
+        short_gap: float = DEFAULT_SHORT_GAP,
+        conf_threshold: float = DEFAULT_CONF_THRESHOLD,
+        retain_margin: float = DEFAULT_RETAIN_MARGIN,
+    ) -> None:
+        self._index = index if index is not None else ToolGapIndex()
+        self._short_gap = short_gap
+        self._conf_threshold = conf_threshold
+        self._retain_margin = retain_margin
+        # conversation_id -> time it was last seen, to measure the realized re-arrival gap.
+        self._last_seen: OrderedDict[int, float] = OrderedDict()
+
+    def _learn(self, req: RequestView, now: float) -> None:
+        """Record the realized gap since this conversation's previous turn (timing only).
+
+        The gap belongs to the tool whose result now sits in the history -- this request's
+        most recent tool call.
+        """
+        gap = observe_gap(self._last_seen, req.conversation_id, req.last_tool_name, now)
+        if gap is not None:
+            assert req.last_tool_name is not None  # observe_gap returns None when it is
+            self._index.record(req.last_tool_name, gap)
+
+    def __call__(
+        self, req: RequestView, nodes: list[Node], now: float, params: CostParams
+    ) -> Placement:
+        self._learn(req, now)
+        # Route exactly as class-aware does; only tool-session turns gain retention on top.
+        place = class_aware(req, nodes, now, params)
+        if classify(req) != "tool":
+            return place
+
+        # Soft-pin the prefix if a confident, short return is predicted for this tool.
+        mean, var = self._index.predict(req.last_tool_name)
+        if gap_confidence(mean, var) >= self._conf_threshold and mean <= self._short_gap:
+            # Keep the prefix warm at least mean * margin, but extend by one standard
+            # deviation when the (confident-but-nonzero) spread pushes likely returns past
+            # that -- so we don't drop the pin just before a higher-variance session returns.
+            window = max(mean * self._retain_margin, mean + var**0.5)
+            return Placement(place.node_id, place.transfer, place.regime, place.ttft, now + window)
+        return place
+
+
 def oracle(req: RequestView, nodes: list[Node], now: float, params: CostParams) -> Placement:
     return best_placement(req.blocks, nodes, now, params, allow_transfer=True)
 
 
-def build_policy(name: str) -> Policy:
+def build_policy(name: str, *, retain_margin: float = DEFAULT_RETAIN_MARGIN) -> Policy:
     if name == "round-robin":
         return RoundRobin()
     if name == "cache-local":
@@ -280,9 +472,29 @@ def build_policy(name: str) -> Policy:
         return WeightedScorers(precise=False)
     if name == "class-aware":
         return class_aware
-    if name == "oracle":
+    if name == "class-aware-reliability":
+        return ClassAwareReliability(retain_margin=retain_margin)
+    if name == "oracle" or name in BELADY_POLICIES:
+        # oracle-belady shares the oracle *router*; it differs only in node-side eviction,
+        # which run_simulation realizes when told the policy is in BELADY_POLICIES. The
+        # routing function alone cannot encode that, so callers must consult uses_belady().
         return oracle
     raise ValueError(f"unknown policy: {name}")
+
+
+# Policies that differ from a plain oracle only in node-side eviction strategy (Belady's
+# MIN). run_simulation must be given belady=True for these, so the single source of truth
+# lives here rather than as a magic string re-derived in the CLI and report.
+BELADY_POLICIES = frozenset({"oracle-belady"})
+
+# Oracle baselines for the cross-policy TTFT-gap metric, strongest first; the report uses
+# the best one present in a given run.
+ORACLE_BASELINES = ("oracle-belady", "oracle")
+
+
+def uses_belady(name: str) -> bool:
+    """Whether policy ``name`` requires run_simulation(..., belady=True) to realize it."""
+    return name in BELADY_POLICIES
 
 
 POLICY_NAMES = (
@@ -292,5 +504,7 @@ POLICY_NAMES = (
     "weighted-precise",
     "weighted-approx",
     "class-aware",
+    "class-aware-reliability",
     "oracle",
+    "oracle-belady",
 )

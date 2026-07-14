@@ -60,7 +60,9 @@ class MetricsClient:
         return None
 
 
-def compute_percentiles(data: list[float], percentiles: list[int] | None = None) -> dict:
+def compute_percentiles(
+    data: list[float], percentiles: list[int] | None = None
+) -> dict[int, float]:
     if percentiles is None:
         percentiles = [50, 90, 99]
     if not data:

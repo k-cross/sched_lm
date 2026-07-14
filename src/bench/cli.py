@@ -5,7 +5,7 @@ import click
 
 from bench.metrics import MetricsClient, compute_percentiles
 from bench.report import generate_report, generate_sim_report
-from bench.sim.policies import POLICY_NAMES
+from bench.sim.policies import DEFAULT_RETAIN_MARGIN, POLICY_NAMES, uses_belady
 from bench.traffic import run_session_traffic, run_traffic
 
 
@@ -229,6 +229,18 @@ def _parse_mix(ctx, param, value: str) -> dict[str, float]:
 @click.option("--block-size", default=16, help="KV block size in tokens")
 @click.option("--bandwidth", default=4e9, help="KV-transfer interconnect bandwidth (bytes/s)")
 @click.option("--cache-blocks", default=2048, help="KV cache capacity per node, in blocks")
+@click.option(
+    "--tool-reliability",
+    is_flag=True,
+    default=False,
+    help="Model per-tool reliability so re-arrival gaps vary by tool (enables the "
+    "class-aware-reliability signal)",
+)
+@click.option(
+    "--retain-margin",
+    default=DEFAULT_RETAIN_MARGIN,
+    help="class-aware-reliability: keep a prefix warm for predicted_gap x this margin",
+)
 @click.option("--seed", default=0, help="Workload RNG seed")
 def simulate(
     policies,
@@ -246,6 +258,8 @@ def simulate(
     block_size,
     bandwidth,
     cache_blocks,
+    tool_reliability,
+    retain_margin,
     seed,
 ):
     """Offline discrete-event simulation of prefix-cache routing policies.
@@ -276,6 +290,7 @@ def simulate(
         tool_result_tokens=tool_result_tokens,
         think_time=think_time,
         burst_cv=burst_cv,
+        tool_reliability=tool_reliability,
         block_size=block_size,
         seed=seed,
     )
@@ -283,7 +298,10 @@ def simulate(
     results = {}
     for name in policies:
         click.echo(f"Simulating policy: {name} ({len(requests)} requests across {nodes} nodes)")
-        results[name] = run_simulation(requests, build_policy(name), nodes, cache_blocks, params)
+        policy = build_policy(name, retain_margin=retain_margin)
+        results[name] = run_simulation(
+            requests, policy, nodes, cache_blocks, params, belady=uses_belady(name)
+        )
 
     click.echo("\n")
     generate_sim_report(results)

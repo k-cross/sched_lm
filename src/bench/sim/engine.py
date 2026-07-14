@@ -7,20 +7,25 @@ so every policy is judged on the same arrivals). For each request we:
   2. ask the policy for its placement, recompute that placement's *true* TTFT on the same
      state (so an approximate policy is charged its real cost, not its own estimate),
   3. admit the request to the chosen node -- advancing its queue and seeding its cache,
-  4. record TTFT, the regime chosen, regret vs. the oracle, and whether the decision was
-     *coupled* to other nodes' load.
+  4. record TTFT, the regime chosen, *routing regret* vs. the oracle on this simulation's
+     own node state, and whether the decision was *coupled* to other nodes' load.
+
+Note: routing regret measures how well a policy *routes* given its own cache contents. It
+is **not** comparable across policies with different eviction strategies (e.g. LRU vs.
+Belady's MIN). For a cross-policy distance-from-best metric, see the TTFT gap column in
+the report, which uses a single oracle baseline for every row.
 
 The result is shaped like ``traffic.BenchmarkResult`` (``ttfts``/``e2e_latencies``/
 ``successes``/``errors``) so the existing percentile + report code renders it unchanged,
 with the extra sim-only fields carried alongside.
 """
 
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 
 from bench.sim.cost import CostParams, Placement, Regime, best_placement, hot_node, predict
-from bench.sim.node import Node
-from bench.sim.policies import Policy, RequestView
+from bench.sim.node import BeladyNode, Node
+from bench.sim.policies import Policy, RequestView, observe_gap
 from bench.sim.workload import TurnRequest
 
 
@@ -33,6 +38,8 @@ def request_view(req: TurnRequest) -> RequestView:
         num_messages=len(req.messages),
         has_tool_messages=any(m["role"] == "tool" for m in req.messages),
         last_message_tokens=len(last.split()),
+        conversation_id=req.conversation_id,
+        last_tool_name=req.tool_name,
     )
 
 
@@ -61,12 +68,16 @@ class SimResult:
     e2e_latencies: list[float] = field(default_factory=list)
     successes: int = 0
     errors: int = 0
-    regimes: Counter = field(default_factory=Counter)
+    regimes: "Counter[Regime]" = field(default_factory=Counter)
     regrets: list[float] = field(default_factory=list)
     coupled: int = 0
     reused_blocks: int = 0
     total_blocks: int = 0
     by_kind: dict[str, KindStats] = field(default_factory=dict)
+    # Realized inter-turn gaps observed per tool signature (policy-independent workload
+    # property): what a router-side ToolGapIndex learns from. Empty unless the workload was
+    # generated with tool-reliability modeling.
+    gap_by_tool: dict[str, list[float]] = field(default_factory=dict)
 
     @property
     def hit_rate(self) -> float:
@@ -116,19 +127,42 @@ def _is_coupled(
     return (loaded.node_id, loaded.transfer) != (idle.node_id, idle.transfer)
 
 
+def _build_future_uses(requests: list[TurnRequest]) -> dict[int, list[int]]:
+    """Map each block hash to the sorted list of request indices where it appears."""
+    uses: dict[int, list[int]] = {}
+    for idx, req in enumerate(requests):
+        for bh in req.block_hashes:
+            uses.setdefault(bh, []).append(idx)
+    return uses
+
+
 def run_simulation(
     requests: list[TurnRequest],
     policy: Policy,
     num_nodes: int,
     cache_blocks: int,
     params: CostParams,
+    *,
+    belady: bool = False,
 ) -> SimResult:
-    nodes = [Node(i, cache_blocks) for i in range(num_nodes)]
+    nodes: list[Node]
+    if belady:
+        future_uses = _build_future_uses(requests)
+        nodes = [BeladyNode(i, cache_blocks, future_uses) for i in range(num_nodes)]
+    else:
+        nodes = [Node(i, cache_blocks) for i in range(num_nodes)]
     result = SimResult()
+    last_seen: OrderedDict[int, float] = OrderedDict()
 
-    for req in requests:
+    for idx, req in enumerate(requests):
         blocks = req.block_hashes
         now = req.arrival
+
+        # Observed re-arrival gap per tool (policy-independent): the gap since a
+        # conversation's previous turn belongs to the tool whose result now sits in history.
+        gap = observe_gap(last_seen, req.conversation_id, req.tool_name, now)
+        if gap is not None and req.tool_name is not None:
+            result.gap_by_tool.setdefault(req.tool_name, []).append(gap)
 
         oracle_p = best_placement(blocks, nodes, now, params)
         if _is_coupled(blocks, nodes, now, params, oracle_p):
@@ -162,6 +196,6 @@ def run_simulation(
 
         missing = len(blocks) - resident
         service = params.prefill_time(missing) + req.gen_tokens * params.inter_token
-        node.admit(now, service, blocks)
+        node.admit(now, service, blocks, retain_until=chosen.retain_until, at_index=idx)
 
     return result
