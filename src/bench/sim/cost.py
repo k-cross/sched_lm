@@ -68,11 +68,15 @@ class Placement:
     transfer: bool
     regime: Regime
     ttft: float
-    # Soft-pin expiry a policy may set to keep the chosen node's copy of this request's
-    # prefix warm until the session is predicted to return. 0.0 = no retention (pure LRU).
-    # Meaningful only on a policy's *returned* placement; the cost candidates from
-    # ``predict``/``best_placement`` always leave it 0.0.
+    # Retention directive a policy may attach to keep (or shed) the chosen node's copy of
+    # this request's prefix (RFC-0001 §1). ``retain_until`` is the lease expiry; 0.0 = no
+    # lease. ``priority`` is the numeric rank (:mod:`bench.sim.priority`): ``None`` unmarked
+    # (plain LRU), ``-1`` evict-first, ``50``/``100`` retain harder. ``None`` + a future
+    # ``retain_until`` is the legacy soft-pin (HIGH lease). Both are meaningful only on a
+    # policy's *returned* placement; the cost candidates from ``predict``/``best_placement``
+    # always leave them at the no-directive default.
     retain_until: float = 0.0
+    priority: int | None = None
 
 
 def hot_node(req_blocks: list[int], nodes: list[Node]) -> Node:

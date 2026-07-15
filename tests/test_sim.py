@@ -17,6 +17,7 @@ from bench.sim.policies import (
     oracle,
     uses_belady,
 )
+from bench.sim.priority import EVICT_FIRST, HIGH, PINNED, clamp_priority, class_name
 from bench.sim.workload import Tool, TurnRequest, generate_mixed, generate_sessions
 
 BLOCK = 4
@@ -503,6 +504,71 @@ def test_all_pinned_evicts_soonest_expiring():
     assert node.matched([3]) == 1
 
 
+# --- priority vocabulary / evict-first (RFC-0001 §1/§3) -----------------------
+
+
+def test_priority_vocabulary_values():
+    # The named classes are documentation aliases over the numeric wire values.
+    assert (EVICT_FIRST, HIGH, PINNED) == (-1, 50, 100)
+    assert class_name(None) == "normal"
+    assert class_name(EVICT_FIRST) == "evict-first"
+    assert class_name(PINNED) == "pinned"
+    assert clamp_priority(999) == PINNED and clamp_priority(-9) == EVICT_FIRST
+
+
+def test_evict_first_dropped_before_unmarked():
+    # An evict-first block is below-normal: it must go before plain unmarked traffic, which
+    # #37003's retain-only evictor cannot express.
+    node = Node(0, cache_blocks=2)
+    node.admit(0.0, 1.0, [1], priority=EVICT_FIRST)  # below-normal
+    node.admit(1.0, 1.0, [2])  # unmarked, and newer (LRU would evict block 1)
+    node.admit(2.0, 1.0, [3])  # overflow -> evict the evict-first block, not the LRU one
+    assert node.matched([1]) == 0  # evict-first drained first
+    assert node.matched([2]) == 1  # unmarked survives despite being older than block 3
+    assert node.matched([3]) == 1
+
+
+def test_marked_survives_evict_first_and_unmarked():
+    # Rank order evict-first < unmarked < marked: a HIGH block outlives both.
+    node = Node(0, cache_blocks=1)
+    node.admit(0.0, 1.0, [1], priority=HIGH, retain_until=100.0)
+    node.admit(1.0, 1.0, [2], priority=EVICT_FIRST)  # overflow at cap 1
+    assert node.matched([1]) == 1  # HIGH kept
+    assert node.matched([2]) == 0  # evict-first dropped
+
+
+def test_lower_priority_marked_evicted_first_under_pressure():
+    # All blocks marked-and-unexpired: sacrifice the lowest-priority one and count pressure.
+    node = Node(0, cache_blocks=2)
+    node.admit(0.0, 1.0, [1], priority=PINNED, retain_until=100.0)  # highest rank
+    node.admit(1.0, 1.0, [2], priority=HIGH, retain_until=100.0)  # lower rank
+    node.admit(2.0, 1.0, [3], priority=PINNED, retain_until=100.0)  # overflow, all marked
+    assert node.matched([2]) == 0  # lowest-priority pin sacrificed
+    assert node.matched([1]) == 1 and node.matched([3]) == 1
+    assert node.pinned_evictions == 1  # pressure recorded
+
+
+def test_evicting_unmarked_does_not_count_pressure():
+    # Only marked-and-unexpired evictions are pinned pressure; shedding unmarked/evict-first
+    # blocks is business as usual and must not inflate the counter.
+    node = Node(0, cache_blocks=1)
+    node.admit(0.0, 1.0, [1], priority=EVICT_FIRST)
+    node.admit(1.0, 1.0, [2])  # evicts the evict-first block
+    node.admit(2.0, 1.0, [3])  # evicts an unmarked block
+    assert node.pinned_evictions == 0
+
+
+def test_expired_evict_first_collapses_to_unmarked():
+    # TTL expiry collapses any mark -- including evict-first -- to unmarked uniformly (§3).
+    node = Node(0, cache_blocks=2)
+    node.admit(0.0, 1.0, [1], priority=EVICT_FIRST, retain_until=5.0)  # leased evict-first
+    node.admit(1.0, 1.0, [2])  # unmarked, newer
+    # By now=10 block 1's mark has expired -> both unmarked -> plain LRU evicts the oldest.
+    node.admit(10.0, 1.0, [3])
+    assert node.matched([1]) == 0  # LRU-oldest once its mark lapsed
+    assert node.matched([2]) == 1 and node.matched([3]) == 1
+
+
 # --- class-aware-reliability policy ------------------------------------------
 
 
@@ -547,6 +613,43 @@ def test_reliability_policy_no_retention_for_unknown_tool():
         _tool_view([1, 2, 3, 4], conversation_id=1, last_tool_name="brand_new"), nodes, 0.0, params
     )
     assert p.retain_until == 0.0
+    assert p.priority is None  # no mark at all, plain LRU
+
+
+def test_reliability_policy_marks_high_for_confident_fast_tool():
+    # The retained prefix carries the numeric HIGH priority the router emits on the wire.
+    params = CostParams(block_size=BLOCK)
+    nodes = _nodes(n=2)
+    policy = ClassAwareReliability()
+    blocks = [1, 2, 3, 4]
+    last = None
+    for k in range(6):
+        last = policy(
+            _tool_view(blocks, conversation_id=7, last_tool_name="fast"), nodes, k * 0.3, params
+        )
+    assert last is not None and last.priority == HIGH and last.retain_until > 6 * 0.3
+
+
+def test_reliability_policy_marks_oneshot_evict_first():
+    # One-shots have no reuse: they are marked below-normal so they shed before real traffic.
+    params = CostParams(block_size=BLOCK)
+    nodes = _nodes(n=2)
+    policy = ClassAwareReliability()
+    p = policy(_view([1, 2, 3, 4], num_messages=1), nodes, 0.0, params)
+    assert p.priority == EVICT_FIRST and p.retain_until == 0.0
+
+
+def test_reliability_policy_records_pinned_pressure_under_tight_cache():
+    # A tiny cache under a fast-returning tool workload forces pins to be sacrificed; the
+    # engine surfaces that as pinned_evictions, the router's over-pin signal (RFC-0001 §4).
+    requests = generate_mixed(
+        60, 5, 40.0, mix={"tool": 1.0}, block_size=BLOCK, tool_reliability=True, seed=21
+    )
+    params = CostParams(block_size=BLOCK)
+    rel = run_simulation(requests, build_policy("class-aware-reliability"), 3, 30, params)
+    base = run_simulation(requests, build_policy("class-aware"), 3, 30, params)
+    assert rel.pinned_evictions > 0  # pins really did contend for capacity
+    assert base.pinned_evictions == 0  # class-aware sets no directives -> never pressured
 
 
 def test_reliability_policy_beats_class_aware_on_tool_hit_rate():

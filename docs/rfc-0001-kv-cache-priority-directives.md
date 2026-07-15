@@ -331,7 +331,12 @@ Phased so each step is independently testable; EPP work is last (most uncertaint
 3. **Multi-tenant fairness**: per-client or per-`retention_scope` pin budgets, or is
    max-TTL cap + pressure metric enough for v1? (#37003 is silent on budgets.)
    Important but deferred — needs dedicated fairness simulation work; revisit after the
-   prototype phases land.
+   prototype phases land. Early evidence this is real, not hypothetical: the phase-1 sim
+   already shows `class-aware-reliability` losing tool-class hit rate to plain
+   `class-aware` at some cache sizes — concurrent sessions' pins evict each other under
+   contention, worse than letting LRU pick the true least-recently-used block[^12]. The
+   `pinned_evictions` counter (§4) tracks it; whether a pressure metric alone is enough
+   to self-correct, or a budget is needed, is exactly what this open question asks.
 
 [^1]: [vllm-project/vllm#37003 — "[RFC]: Context-Aware KV-Cache Retention API
     (Prioritized Evictions)"](https://github.com/vllm-project/vllm/issues/37003).
@@ -379,3 +384,7 @@ Phased so each step is independently testable; EPP work is last (most uncertaint
     docs)](https://llm-d.ai/docs/architecture/Components/kv-cache-manager) and
     [llm-d/llm-d-kv-cache](https://github.com/llm-d/llm-d-kv-cache) — the existing
     backward channel this RFC extends.
+
+[^12]: `docs/policies.md` §"Known issue — over-pinning under moderate cache pressure",
+    reproducible via `bench simulate` with 3 nodes, `--cache-blocks 200`,
+    `--mix tool=1.0`, `--tool-reliability --seed 21`.

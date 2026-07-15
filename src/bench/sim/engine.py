@@ -73,6 +73,9 @@ class SimResult:
     coupled: int = 0
     reused_blocks: int = 0
     total_blocks: int = 0
+    # Marked-and-unexpired blocks evicted under pressure, summed across nodes: the
+    # pinned-pressure signal a router watches to tell whether it over-pinned (RFC-0001 §4).
+    pinned_evictions: int = 0
     by_kind: dict[str, KindStats] = field(default_factory=dict)
     # Realized inter-turn gaps observed per tool signature (policy-independent workload
     # property): what a router-side ToolGapIndex learns from. Empty unless the workload was
@@ -196,6 +199,14 @@ def run_simulation(
 
         missing = len(blocks) - resident
         service = params.prefill_time(missing) + req.gen_tokens * params.inter_token
-        node.admit(now, service, blocks, retain_until=chosen.retain_until, at_index=idx)
+        node.admit(
+            now,
+            service,
+            blocks,
+            retain_until=chosen.retain_until,
+            at_index=idx,
+            priority=chosen.priority,
+        )
 
+    result.pinned_evictions = sum(n.pinned_evictions for n in nodes)
     return result

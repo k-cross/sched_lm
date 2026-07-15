@@ -34,11 +34,12 @@ plus body-derived observables), not the generator's ``TurnRequest``.
 
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from bench.sim.blocks import matched_prefix
 from bench.sim.cost import CostParams, Placement, best_placement, hot_node, predict
 from bench.sim.node import Node
+from bench.sim.priority import EVICT_FIRST, HIGH
 
 # GIE-style saturation filter threshold, in nominal requests of queue depth.
 DEFAULT_SATURATION_DEPTH = 8
@@ -404,10 +405,16 @@ class ClassAwareReliability:
 
     When a tool-session turn is routed and its most recent tool call **confidently** predicts
     a **short** return (low-variance, short-mean), the chosen node's copy of this prefix is
-    soft-pinned (``retain_until``) so it survives eviction until the session comes back --
-    turning what would have been a recompute into a cheap cache hit. A long predicted gap, or
-    an unpredictable (high-variance) or unseen tool, adds no retention: the router does not
-    gamble cache on an unreliable prediction.
+    marked :data:`~bench.sim.priority.HIGH` with a ``retain_until`` lease so it survives
+    eviction until the session comes back -- turning what would have been a recompute into a
+    cheap cache hit. A long predicted gap, or an unpredictable (high-variance) or unseen
+    tool, adds no retention: the router does not gamble cache on an unreliable prediction.
+
+    One-shots -- no future reuse, pure cache pollution -- are marked
+    :data:`~bench.sim.priority.EVICT_FIRST` so their blocks are dropped *before* unmarked
+    traffic, the below-normal rank #37003's retain-only evictor cannot express (RFC-0001 §1,
+    §5). Both directives ride the returned :class:`~bench.sim.cost.Placement`; routing itself
+    is unchanged from :func:`class_aware`.
     """
 
     def __init__(
@@ -439,19 +446,23 @@ class ClassAwareReliability:
         self, req: RequestView, nodes: list[Node], now: float, params: CostParams
     ) -> Placement:
         self._learn(req, now)
-        # Route exactly as class-aware does; only tool-session turns gain retention on top.
+        # Route exactly as class-aware does; classes differ only in the directive on top.
         place = class_aware(req, nodes, now, params)
-        if classify(req) != "tool":
+        kind = classify(req)
+        if kind == "oneshot":
+            # No reuse: shed the prefix before it evicts anything with retention value.
+            return replace(place, priority=EVICT_FIRST)
+        if kind != "tool":
             return place
 
-        # Soft-pin the prefix if a confident, short return is predicted for this tool.
+        # Mark the prefix HIGH if a confident, short return is predicted for this tool.
         mean, var = self._index.predict(req.last_tool_name)
         if gap_confidence(mean, var) >= self._conf_threshold and mean <= self._short_gap:
             # Keep the prefix warm at least mean * margin, but extend by one standard
             # deviation when the (confident-but-nonzero) spread pushes likely returns past
             # that -- so we don't drop the pin just before a higher-variance session returns.
             window = max(mean * self._retain_margin, mean + var**0.5)
-            return Placement(place.node_id, place.transfer, place.regime, place.ttft, now + window)
+            return replace(place, retain_until=now + window, priority=HIGH)
         return place
 
 
