@@ -193,15 +193,26 @@ queue-threshold filter.
 either a `Scorer` (score pods 0–1; see the
 [existing scorers](https://pkg.go.dev/github.com/llm-d/llm-d-inference-scheduler/pkg/scheduling/plugins/scorer))
 or, better for per-class routing, a **ProfileHandler** that picks a scheduling
-profile per request. The EPP sees the full request body, so `RequestView`'s
-observables (tool role present, message count, user-message size) translate
-directly; `classify()` becomes the profile pick, each class a profile with
-different scorer weights. Ship it: implement + register the plugin, build the
-EPP image, reference it in the config YAML, point the `InferencePool` at the
-image, and validate on this repo's k3d stack (`bench report --workload
-sessions`) before touching GPUs. `RequestView.label` anticipates GIE's
-[body-based routing](https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/main/pkg/bbr/README.md)
-setting a class header upstream of the EPP.
+profile per request.
+
+We have provided a reference implementation of this Go plugin at [src/gateway-plugin/](src/gateway-plugin/). It implements:
+- A `ToolGapIndex` for tracking request re-arrival gaps (EWMA).
+- A `ClassAwareReliability` profile handler that classifies chat requests as `tool`, `rag`, or `oneshot` and picks the correct routing profile.
+
+To verify and compile the plugin:
+```bash
+cd src/gateway-plugin
+go mod tidy
+go build
+```
+
+To run traffic utilizing this strategy in the live stack:
+```bash
+uv run bench traffic --route class-aware-reliability ...
+```
+This is mapped to the `llm-route-class-aware-reliability` HTTPRoute in the gateway config.
+
+> **Note on Cache Pinning**: The `class-aware-reliability` plugin accurately tracks tool inter-arrival gaps (via EWMA) using traffic timing metadata. However, the upstream `llm-d-router` / Gateway API Inference Extension does not currently support explicit cache pinning directives (like `retain_until`). Thus, while the tracking logic mirrors the offline simulator perfectly, the live stack cannot currently execute the soft-pinning action on backend KV caches.
 
 **Tier 2 — a serving-stack change.** The transfer regime is not expressible in
 stock llm-d: there is no inter-replica KV-transfer path (hence the `weighted-*`

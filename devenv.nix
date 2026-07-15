@@ -8,6 +8,7 @@
     kubernetes-helm
     jq
     curl
+    go
   ];
 
   # ── Python with uv ──────────────────────────────────────────────

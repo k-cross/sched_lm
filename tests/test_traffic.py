@@ -58,18 +58,21 @@ class _FakeSession:
         return _FakeResponse(self)
 
 
-def test_run_traffic_injects_route_header(monkeypatch):
+import pytest
+
+@pytest.mark.parametrize("route", ["round-robin", "prefix-affinity", "class-aware-reliability"])
+def test_run_traffic_injects_route_header(monkeypatch, route):
     session = _FakeSession()
     monkeypatch.setattr("bench.traffic.aiohttp.ClientSession", lambda: session)
 
     result = asyncio.run(
-        run_traffic("http://gw/v1/chat/completions", 3, concurrency=2, route="round-robin", qps=0)
+        run_traffic("http://gw/v1/chat/completions", 3, concurrency=2, route=route, qps=0)
     )
 
     assert result.successes == 3
     assert result.errors == 0
     assert len(session.calls) == 3
-    assert all(c["headers"][ROUTE_HEADER] == "round-robin" for c in session.calls)
+    assert all(c["headers"][ROUTE_HEADER] == route for c in session.calls)
 
 
 def test_run_traffic_paces_to_qps(monkeypatch):

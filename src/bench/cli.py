@@ -26,7 +26,7 @@ def _run_route(route, requests, qps, concurrency, gateway_url, workload, session
 
 
 @main.command()
-@click.option("--route", type=click.Choice(["round-robin", "prefix-affinity"]), required=True)
+@click.option("--route", type=click.Choice(["round-robin", "prefix-affinity", "class-aware-reliability"]), required=True)
 @click.option("--requests", default=100, help="Number of requests to send (single-shot workload)")
 @click.option("--qps", default=5.0, help="Target queries per second")
 @click.option("--concurrency", default=10, help="Max concurrent requests")
@@ -84,7 +84,7 @@ def metrics(prometheus_url):
 @click.option(
     "--compare",
     multiple=True,
-    type=click.Choice(["round-robin", "prefix-affinity"]),
+    type=click.Choice(["round-robin", "prefix-affinity", "class-aware-reliability"]),
     help="Routes to compare",
 )
 @click.option("--requests", default=100, help="Number of requests to send per route")
