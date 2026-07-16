@@ -1,0 +1,4 @@
+[submodule "third_party/llm-d-inference-sim"]
+	path = third_party/llm-d-inference-sim
+	url = git@github.com:k-cross/llm-d-inference-sim.git
+	branch = rfc-0001-retention-directives

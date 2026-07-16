@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 
 import click
@@ -6,7 +7,13 @@ import click
 from bench.metrics import MetricsClient, compute_percentiles
 from bench.report import generate_report, generate_sim_report
 from bench.sim.policies import DEFAULT_RETAIN_MARGIN, POLICY_NAMES, uses_belady
+from bench.sim.priority import MAX_PRIORITY, MIN_PRIORITY
 from bench.traffic import run_session_traffic, run_traffic
+
+# Go duration grammar (a sequence of signed decimal number + unit), the form the forked
+# sim's ttl= parses. Validated client-side so a typo is rejected instead of silently
+# falling back to the server's default lease.
+_GO_DURATION_RE = re.compile(r"^\d+(\.\d+)?(ns|us|µs|ms|s|m|h)([0-9.]+(ns|us|µs|ms|s|m|h))*$")
 
 
 @click.group()
@@ -15,18 +22,57 @@ def main():
     pass
 
 
-def _run_route(route, requests, qps, concurrency, gateway_url, workload, sessions, turns, seed):
+def _kv_priority_header(priority, ttl, scope):
+    """Build the RFC-0001 x-kv-cache-priority header value, or None when no priority is set.
+
+    Grammar (router path, §2): ``<int>[; ttl=<Go duration>][; scope=<id>]``. The forked
+    llm-d-inference-sim parses this; ttl is a Go duration string (e.g. ``3s``, ``500ms``).
+    Raises ``click.UsageError`` when ttl/scope are given without a priority (they would be
+    silently dropped) or when ttl is not a valid Go duration.
+    """
+    if priority is None:
+        if ttl or scope:
+            raise click.UsageError("--kv-ttl/--kv-scope require --kv-priority")
+        return None
+    if ttl and not _GO_DURATION_RE.match(ttl):
+        raise click.UsageError(f"--kv-ttl {ttl!r} is not a Go duration (e.g. 3s, 500ms, 1m30s)")
+    value = str(priority)
+    if ttl:
+        value += f"; ttl={ttl}"
+    if scope:
+        value += f"; scope={scope}"
+    return value
+
+
+def _run_route(
+    route,
+    requests,
+    qps,
+    concurrency,
+    gateway_url,
+    workload,
+    sessions,
+    turns,
+    seed,
+    kv_priority=None,
+):
     """Drive one route with either the single-shot or the tool-calling-session workload."""
     if workload == "sessions":
         from bench.sim.workload import generate_sessions
 
         turn_requests = generate_sessions(sessions, turns, qps, seed=seed)
-        return asyncio.run(run_session_traffic(gateway_url, turn_requests, concurrency, route))
-    return asyncio.run(run_traffic(gateway_url, requests, concurrency, route, qps))
+        return asyncio.run(
+            run_session_traffic(gateway_url, turn_requests, concurrency, route, kv_priority)
+        )
+    return asyncio.run(run_traffic(gateway_url, requests, concurrency, route, qps, kv_priority))
 
 
 @main.command()
-@click.option("--route", type=click.Choice(["round-robin", "prefix-affinity", "class-aware-reliability"]), required=True)
+@click.option(
+    "--route",
+    type=click.Choice(["round-robin", "prefix-affinity", "class-aware-reliability"]),
+    required=True,
+)
 @click.option("--requests", default=100, help="Number of requests to send (single-shot workload)")
 @click.option("--qps", default=5.0, help="Target queries per second")
 @click.option("--concurrency", default=10, help="Max concurrent requests")
@@ -42,17 +88,53 @@ def _run_route(route, requests, qps, concurrency, gateway_url, workload, session
 @click.option(
     "--gateway-url", default="http://localhost:8080/v1/chat/completions", help="Gateway URL"
 )
-def traffic(route, requests, qps, concurrency, workload, sessions, turns, seed, gateway_url):
+@click.option(
+    "--kv-priority",
+    type=click.IntRange(MIN_PRIORITY, MAX_PRIORITY),
+    default=None,
+    help=f"RFC-0001 escape hatch: send x-kv-cache-priority on every request "
+    f"({MIN_PRIORITY} evict-first .. {MAX_PRIORITY} pinned). Proves the directive path "
+    f"to the forked sim.",
+)
+@click.option("--kv-ttl", default=None, help="Lease for --kv-priority, a Go duration (e.g. 3s)")
+@click.option("--kv-scope", default=None, help="Session/program scope for --kv-priority")
+def traffic(
+    route,
+    requests,
+    qps,
+    concurrency,
+    workload,
+    sessions,
+    turns,
+    seed,
+    gateway_url,
+    kv_priority,
+    kv_ttl,
+    kv_scope,
+):
     """Run synthetic traffic generator against a specific routing strategy"""
     click.echo(
         f"Starting {workload} traffic for route: {route} (qps={qps}, concurrency={concurrency})"
     )
 
+    kv_priority_header = _kv_priority_header(kv_priority, kv_ttl, kv_scope)
+    if kv_priority_header is not None:
+        click.echo(f"Attaching x-kv-cache-priority: {kv_priority_header}")
+
     # `route` selects the gateway HTTPRoute via the x-llmd-route header:
     # `round-robin` bypasses the EPP extProc (default k8s load balancing), while
     # `prefix-affinity` falls through to the EPP-backed default route.
     result = _run_route(
-        route, requests, qps, concurrency, gateway_url, workload, sessions, turns, seed
+        route,
+        requests,
+        qps,
+        concurrency,
+        gateway_url,
+        workload,
+        sessions,
+        turns,
+        seed,
+        kv_priority_header,
     )
 
     ttfts = compute_percentiles(result.ttfts)

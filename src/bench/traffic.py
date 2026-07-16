@@ -16,6 +16,12 @@ if TYPE_CHECKING:
 # default prefix-affinity route. See infra/llm-d/inference-pool.yaml.
 ROUTE_HEADER = "x-llmd-route"
 
+# RFC-0001 §2 router-path directive header, honored by the forked llm-d-inference-sim
+# (third_party/). Value grammar: `<int>[; ttl=<Go duration>][; scope=<id>]`. Sending it
+# from the client is the escape hatch that proves the directive path end-to-end before any
+# EPP work exists to inject it.
+KV_CACHE_PRIORITY_HEADER = "x-kv-cache-priority"
+
 USER_PROMPTS = [
     "Write a short poem about the ocean.",
     "Explain quantum computing in simple terms.",
@@ -40,6 +46,7 @@ async def _stream_chat(
     messages: list[dict[str, str]],
     result: BenchmarkResult,
     max_tokens: int = 50,
+    kv_priority: str | None = None,
 ):
     """POST a chat-completions request, timing TTFT from the first streamed chunk."""
     payload = {
@@ -49,6 +56,8 @@ async def _stream_chat(
         "max_tokens": max_tokens,
     }
     headers = {ROUTE_HEADER: route}
+    if kv_priority is not None:
+        headers[KV_CACHE_PRIORITY_HEADER] = kv_priority
 
     start_time = time.monotonic()
     ttft = None
@@ -73,13 +82,17 @@ async def _stream_chat(
 
 
 async def generate_request(
-    session: aiohttp.ClientSession, url: str, route: str, result: BenchmarkResult
+    session: aiohttp.ClientSession,
+    url: str,
+    route: str,
+    result: BenchmarkResult,
+    kv_priority: str | None = None,
 ):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": random.choice(USER_PROMPTS)},
     ]
-    await _stream_chat(session, url, route, messages, result)
+    await _stream_chat(session, url, route, messages, result, kv_priority=kv_priority)
 
 
 async def _bounded_request(
@@ -88,9 +101,10 @@ async def _bounded_request(
     url: str,
     route: str,
     result: BenchmarkResult,
+    kv_priority: str | None = None,
 ):
     try:
-        await generate_request(session, url, route, result)
+        await generate_request(session, url, route, result, kv_priority=kv_priority)
     finally:
         sem.release()
 
@@ -101,6 +115,7 @@ async def run_traffic(
     concurrency: int,
     route: str,
     qps: float = 0.0,
+    kv_priority: str | None = None,
 ) -> BenchmarkResult:
     """Drive `num_requests` at the gateway using the given routing strategy.
 
@@ -127,7 +142,9 @@ async def run_traffic(
 
             # Bound in-flight requests; blocks here when concurrency is saturated.
             await sem.acquire()
-            task = asyncio.create_task(_bounded_request(sem, session, target_url, route, result))
+            task = asyncio.create_task(
+                _bounded_request(sem, session, target_url, route, result, kv_priority)
+            )
             tasks.append(task)
 
         if tasks:
@@ -141,6 +158,7 @@ async def run_session_traffic(
     requests: "list[TurnRequest]",
     concurrency: int,
     route: str,
+    kv_priority: str | None = None,
 ) -> BenchmarkResult:
     """Replay tool-calling sessions against the live gateway.
 
@@ -162,7 +180,9 @@ async def run_session_traffic(
     async def run_one(turns: "list[TurnRequest]"):
         async with sem, aiohttp.ClientSession() as session:
             for turn in turns:
-                await _stream_chat(session, target_url, route, turn.messages, result)
+                await _stream_chat(
+                    session, target_url, route, turn.messages, result, kv_priority=kv_priority
+                )
 
     await asyncio.gather(*(run_one(turns) for turns in by_session.values()))
     return result
