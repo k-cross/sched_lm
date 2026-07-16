@@ -211,6 +211,8 @@ def report(
     results = {}
     cache_hit_rates = {}
     prefill_times = {}
+    pinned_usages = {}
+    pinned_evictions_map = {}
 
     metrics_client = MetricsClient(prometheus_url)
 
@@ -222,6 +224,7 @@ def report(
         # rate() window that mixes both routes. Requires a scrape to have
         # captured the pre-traffic state -- it usually has from prior runs.
         hits_before, queries_before = asyncio.run(metrics_client.get_prefix_cache_counters())
+        evictions_before = asyncio.run(metrics_client.get_pinned_evictions())
 
         result = _run_route(
             route, requests, qps, concurrency, gateway_url, workload, sessions, turns, seed
@@ -236,10 +239,13 @@ def report(
         time.sleep(settle)
         hits_after, queries_after = asyncio.run(metrics_client.get_prefix_cache_counters())
         prefill = asyncio.run(metrics_client.get_avg_prefill_time())
+        pinned_usage = asyncio.run(metrics_client.get_pinned_usage())
+        evictions_after = asyncio.run(metrics_client.get_pinned_evictions())
 
         queries_delta = queries_after - queries_before
         hits_delta = hits_after - hits_before
         hit_rate = hits_delta / queries_delta if queries_delta > 0 else 0.0
+        evictions_delta = evictions_after - evictions_before
 
         results[route] = {
             "requests": result.successes + result.errors,
@@ -249,13 +255,14 @@ def report(
             "ttft_p50": ttfts.get(50, 0),
             "ttft_p99": ttfts.get(99, 0),
             "e2e_p50": e2e.get(50, 0),
-            "e2e_p99": e2e.get(99, 0),
         }
         cache_hit_rates[route] = hit_rate
         prefill_times[route] = prefill
+        pinned_usages[route] = pinned_usage
+        pinned_evictions_map[route] = evictions_delta
 
     click.echo("\n")
-    generate_report(results, cache_hit_rates, prefill_times)
+    generate_report(results, cache_hit_rates, prefill_times, pinned_usages, pinned_evictions_map)
 
 
 def _parse_mix(ctx, param, value: str) -> dict[str, float]:

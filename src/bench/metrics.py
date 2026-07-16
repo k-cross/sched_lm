@@ -59,6 +59,35 @@ class MetricsClient:
             return total / count
         return None
 
+    # ------------------------------------------------------------------
+    # Priority / retention metrics (RFC-0001 §4)
+    # ------------------------------------------------------------------
+
+    async def get_pinned_usage(self) -> float:
+        """Fraction of cache occupied by marked-and-unexpired blocks (0–1).
+
+        Averages the per-sim gauge rather than summing it: each pod reports its own
+        occupancy fraction, so ``sum`` would scale with replica count and exceed 1.0.
+        """
+        return await self._scalar("avg(vllm:kv_cache_pinned_usage_perc)")
+
+    async def get_pinned_evictions(self) -> float:
+        """Cumulative pinned-eviction counter summed over all sims.
+
+        Callers diff across runs to get the per-route delta, like
+        :meth:`get_prefix_cache_counters`.
+        """
+        return await self._scalar("sum(vllm:kv_cache_pinned_evictions_total)")
+
+    async def get_priority_blocks(self) -> dict[str, float]:
+        """Per-priority-band resident block counts summed over all sims."""
+        evict_first = await self._scalar(
+            'sum(vllm:kv_cache_priority_blocks{priority="evict_first"})'
+        )
+        high = await self._scalar('sum(vllm:kv_cache_priority_blocks{priority="high"})')
+        pinned = await self._scalar('sum(vllm:kv_cache_priority_blocks{priority="pinned"})')
+        return {"evict_first": evict_first, "high": high, "pinned": pinned}
+
 
 def compute_percentiles(
     data: list[float], percentiles: list[int] | None = None

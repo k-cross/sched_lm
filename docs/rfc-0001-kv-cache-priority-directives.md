@@ -297,18 +297,39 @@ lands as a comment on #37003 while its window is open (prototype plan step 5):
 
 Phased so each step is independently testable; EPP work is last (most uncertainty).
 
-1. **Offline sim parity** — extend `Placement`/`Node` from `retain_until`-only to the
-   priority vocabulary (`src/bench/sim/{node,cost,engine,policies}.py`); the sim
-   becomes the executable spec. Backward compatible; existing tests pass unchanged.
-2. **Sim fork honors directives** — fork `llm-d/llm-d-inference-sim` (submodule
-   `third_party/`); implement the two-queue + evict-first evictor in `pkg/kv-cache/`;
-   parse the header first, `extra_body` `RetentionDirective`s second (header needs no
-   body plumbing). Client-side `--kv-priority` escape hatch in `bench traffic` proves
-   the path before any EPP work.
-3. **Stats** — §4 metrics + trailing event fields in the fork (compat encoded as a fork
-   test against the real `llm-d-kv-cache@v0.9.0` adapter); `bench metrics`/`report`
-   grow pinned columns, hint-on/off A/B, session-completion-time / zero-recompute /
-   TTFT-by-turn measures, and the non-agentic throughput guardrail.
+1. **Offline sim parity** — ✅ **done** (2026-07-15). Extended `Placement`/`Node` from
+   `retain_until`-only to the priority vocabulary (new `src/bench/sim/priority.py`:
+   `EVICT_FIRST=-1`, `HIGH=50`, `PINNED=100` + clamp; `node.py` now holds `(priority,
+   expiry)` buckets with effective rank `evict-first < unmarked < priority asc`, TTL
+   expiry collapsing to unmarked, and a `pinned_evictions` over-pin counter). The sim is
+   now the executable spec of §3's priority model. Backward compatible — legacy
+   `retain_until` maps to a HIGH lease (fuzz-verified byte-identical eviction); all prior
+   tests pass unchanged. `ClassAwareReliability` emits HIGH on confident tool-session
+   pins, EVICT_FIRST on one-shots.
+2. **Sim fork honors directives** — ✅ **done** (2026-07-15). Forked
+   `llm-d/llm-d-inference-sim` (submodule `third_party/llm-d-inference-sim`, branch
+   `rfc-0001-retention-directives` off tag v0.9.2). The directive type, `x-kv-cache-priority`
+   header parse, and clamp live in a new leaf package `pkg/retention` — not `pkg/common`,
+   which already imports `openai-server-api` (import cycle). Rank-aware evictor in
+   `pkg/kv-cache/block_cache.go` (per-block priority+expiry map + `pinnedEvictions`;
+   `pickBlockToEvict` honors evict-first < unmarked < priority asc, TTL→unmarked,
+   all-marked→soonest-expiring under pressure), with a `len(retention)==0` fast path
+   preserving the exact upstream unloaded-first LRU. The directive flows request header →
+   `openaiserverapi.Request` → `blockCache.startRequest`. Client-side escape hatch
+   `bench traffic --kv-priority/-ttl/-scope` emits the header and proves the path before
+   any EPP work (E2E: a pinned prefix survived filler pressure, `cached_tokens` 8 vs 0
+   unmarked). Go tests in `pkg/retention` and `pkg/kv-cache`. The `extra_body`
+   `RetentionDirective` parse is deferred — the header path needs no body plumbing, so it
+   waits until a framework path actually needs it.
+3. **Stats** — ✅ **done** (2026-07-16) for the core stat loop + ZMQ backchannel. §4 Prometheus
+   metrics (`kv_cache_priority_blocks`, `pinned_usage_perc`, `pinned_evictions_total`) and
+   trailing `BlockStored` event fields (`priority`, `retain_until`) in the fork, with a fork
+   test asserting both compat directions against the real `llm-d-kv-cache@v0.9.0` adapter
+   (extra trailing fields decode cleanly; an unknown event tag fails the whole batch — the
+   constraint behind "no new event types in v1"). `bench metrics`/`report` grow pinned
+   columns. The hint-on/off A/B harness and program-level measures (session-completion-time,
+   zero-recompute rate, TTFT-by-turn) and the non-agentic throughput guardrail are **carried
+   into phase 5** (see `rfc-0001-phase-3-plan.md`).
 4. **EPP emission** — custom EPP image with the `PreRequest` plugin; rewrite
    `infra/llm-d/values.yaml` to the real GIE chart schema (current keys don't match the
    chart and are likely inert). Discovery first: dump the live EPP config; confirm

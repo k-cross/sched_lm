@@ -42,6 +42,10 @@ def generate_sim_report(results: "dict[str, SimResult]"):
     table.add_column("Routing regret (s)", justify="right", style="magenta")
     table.add_column("TTFT gap (s)", justify="right", style="magenta")
     table.add_column("Coupled", justify="right", style="magenta")
+    # Pinned-pressure signal (RFC-0001 §4): marked-and-unexpired blocks evicted under
+    # contention. High here is the leading indicator that retention is over-pinning -- worth
+    # reading alongside hit rate, since a policy can win hit rate while thrashing pins.
+    table.add_column("Pinned evict", justify="right", style="red")
 
     # Compute each policy's percentiles once, then read the best-available oracle baseline
     # for the cross-policy TTFT gap column from that same table.
@@ -64,6 +68,7 @@ def generate_sim_report(results: "dict[str, SimResult]"):
             f"{mean_regret:.3f}",
             gap,
             f"{res.coupled_fraction * 100:.1f}%",
+            str(res.pinned_evictions),
         )
 
     console.print(table)
@@ -109,8 +114,12 @@ def generate_report(
     results: dict[str, dict[str, float]],
     cache_hit_rates: dict[str, float],
     prefill_times: dict[str, float | None] | None = None,
+    pinned_usages: dict[str, float | None] | None = None,
+    pinned_evictions: dict[str, float | None] | None = None,
 ):
     prefill_times = prefill_times or {}
+    pinned_usages = pinned_usages or {}
+    pinned_evictions = pinned_evictions or {}
     console = Console()
     table = Table(title="Emulated Prefix-Caching Benchmark Results")
 
@@ -122,9 +131,13 @@ def generate_report(
     table.add_column("E2E p50 (s)", justify="right", style="yellow")
     table.add_column("Cache Hit Rate", justify="right", style="blue")
     table.add_column("Prefill (s)", justify="right", style="magenta")
+    table.add_column("Pinned %", justify="right", style="cyan")
+    table.add_column("Pinned evict", justify="right", style="red")
 
     for strategy, metrics in results.items():
         prefill = prefill_times.get(strategy)
+        p_usage = pinned_usages.get(strategy)
+        p_evict = pinned_evictions.get(strategy)
         table.add_row(
             strategy,
             str(metrics.get("requests", 0)),
@@ -134,6 +147,8 @@ def generate_report(
             f"{metrics.get('e2e_p50', 0):.3f}",
             f"{cache_hit_rates.get(strategy, 0) * 100:.1f}%",
             f"{prefill:.3f}" if prefill is not None else "n/a",
+            f"{p_usage * 100:.1f}%" if p_usage is not None else "n/a",
+            f"{p_evict:.0f}" if p_evict is not None else "n/a",
         )
 
     console.print(table)

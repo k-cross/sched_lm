@@ -1,6 +1,8 @@
 import asyncio
 import time
 
+import pytest
+
 from bench.prompt import (
     _CHARS_PER_TOKEN,
     SYSTEM_PROMPT,
@@ -57,8 +59,6 @@ class _FakeSession:
         self.calls.append({"url": url, "headers": headers})
         return _FakeResponse(self)
 
-
-import pytest
 
 @pytest.mark.parametrize("route", ["round-robin", "prefix-affinity", "class-aware-reliability"])
 def test_run_traffic_injects_route_header(monkeypatch, route):
