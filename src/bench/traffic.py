@@ -2,7 +2,7 @@ import asyncio
 import random
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
@@ -43,7 +43,7 @@ async def _stream_chat(
     session: aiohttp.ClientSession,
     url: str,
     route: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     result: BenchmarkResult,
     max_tokens: int = 50,
     kv_priority: str | None = None,

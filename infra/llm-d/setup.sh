@@ -8,8 +8,9 @@ echo "Adding llm-d helm repository..."
 # We use the oci registry directly for GAIE/llm-d
 
 echo "Deploying Inference Extension CRDs..."
-kubectl apply -k "github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd?ref=v1.4.0"
-helm upgrade --install gaie oci://registry.k8s.io/gateway-api-inference-extension/charts/inferencepool --version v1.4.0 --namespace llm-d --create-namespace --set inferencePool.modelServers.matchLabels.app=vllm-sim -f infra/llm-d/values.yaml
+# v1.5.0 to match the GIE version pinned by llm-d-router v0.9.2 (src/gateway-plugin).
+kubectl apply -k "github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd?ref=v1.5.0"
+helm upgrade --install gaie oci://registry.k8s.io/gateway-api-inference-extension/charts/inferencepool --version v1.5.0 --namespace llm-d --create-namespace -f infra/llm-d/values.yaml
 
 echo "Deploying kgateway (Gateway)..."
 helm upgrade --install kgateway-crds oci://cr.kgateway.dev/kgateway-dev/charts/kgateway-crds --namespace kgateway-system --create-namespace
