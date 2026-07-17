@@ -66,22 +66,29 @@ feedback post.
 
 ## Deliverables
 
-### A. Discovery (read-only; confirm predictions before code)
+### A. Discovery ✅ done (2026-07-17)
 
-- **[D1] Live EPP behavior**: dump the rendered plugins ConfigMap; tail `gaie-epp` logs during
-  a `bench traffic` run with `x-llmd-route: class-aware-reliability`. *Predicted:* headers
-  arrive, scheduling never runs (body-NONE starvation confirmed live).
-- **[D2] kgateway CRD**: confirm `BUFFERED` is a legal `requestBodyMode` value in
-  `gatewayextensions.gateway.kgateway.dev`.
-- **[D3] Chart schema**: `helm show values …/inferencepool --version v1.5.0`; confirm
-  `inferenceExtension.image.*`, `flags`, `pluginsConfigFile`, `pluginsCustomConfig` key names;
-  diff vs v1.4.0.
-- **[D4] Plugin type strings**: exact registered names in v0.9.2's `cmd/epp/runner/runner.go`
-  (`prefix-cache-scorer`, `max-score-picker`, `single-profile-handler`; whether `decode-filter`
-  matters without P/D).
-- **[D5] Tool names on parsed messages**: whether tool-role messages surface a function name
-  after the OpenAI parser (`Message.ToolCalls []any`). *Predicted:* only via assistant-message
-  `tool_calls` → drives the classify/tool-key extraction below.
+- **[D1] Live EPP behavior — starvation confirmed.** The deployed EPP is the *stock GIE*
+  image `registry.k8s.io/gateway-api-inference-extension/epp:v1.4.0` with the stock
+  `default-plugins.yaml` (GIE `inference.networking.x-k8s.io/v1alpha1`; queue/kv-utilization/
+  prefix scorers) — our values.yaml overrode nothing, as suspected. A test POST through the
+  gateway returned 200 in ~0.1 s with **zero** EPP log activity (metrics port is auth-gated),
+  matching the source finding: `director.HandleRequest` only fires in the `RequestBody`
+  extProc phase, which `requestBodyMode: NONE` never produces. Args exactly as predicted
+  (`--pool-name gaie … --config-file /config/default-plugins.yaml --zap-encoder json`).
+- **[D2] kgateway CRD** ✅ `requestBodyMode` enum: `NONE | STREAMED | BUFFERED |
+  BUFFERED_PARTIAL | FULL_DUPLEX_STREAMED` — `BUFFERED` is legal.
+- **[D3] Chart schema v1.5.0** ✅ keys confirmed: `inferenceExtension.image.{registry,
+  repository,tag,pullPolicy}`, `extProcPort: 9002`, `failureMode: FailOpen`,
+  `pluginsConfigFile`, commented `pluginsCustomConfig` example, `flags: {v: 1}` map style.
+  **Caveat:** default resources are `requests: {cpu: "4", memory: 8Gi} / limits: 16Gi` —
+  must be overridden down for k3d.
+- **[D4] Plugin type strings** ✅ `prefix-cache-scorer`, `max-score-picker`,
+  `single-profile-handler` (also `decode-filter`, present even in the module's no-P/D sample
+  `deploy/config/epp-config.yaml` — keep it, matching the reference config).
+- **[D5] Tool names** ✅ as predicted: `Message.ToolCalls []any` (only assistant messages);
+  tool-role messages carry no name → last-assistant-`tool_calls` extraction with
+  `"unknown-tool"` fallback.
 
 ### B. Plugin library (`src/gateway-plugin/`, pure Go)
 
