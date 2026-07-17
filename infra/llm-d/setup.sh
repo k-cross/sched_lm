@@ -13,8 +13,15 @@ kubectl apply -k "github.com/kubernetes-sigs/gateway-api-inference-extension/con
 helm upgrade --install gaie oci://registry.k8s.io/gateway-api-inference-extension/charts/inferencepool --version v1.5.0 --namespace llm-d --create-namespace -f infra/llm-d/values.yaml
 
 echo "Deploying kgateway (Gateway)..."
-helm upgrade --install kgateway-crds oci://cr.kgateway.dev/kgateway-dev/charts/kgateway-crds --namespace kgateway-system --create-namespace
-helm upgrade --install kgateway oci://cr.kgateway.dev/kgateway-dev/charts/kgateway --namespace kgateway-system --create-namespace --set inferenceExtension.enabled=true
+# Pinned. Version notes: kgateway v2.2 removed InferencePool backendRef support from
+# the Envoy data plane (moved to agentgateway), so the EPP is attached with a
+# hand-rolled GatewayExtension/TrafficPolicy in inference-pool.yaml instead; the
+# v2.1.x envoy-wrapper images are unusable anyway on this ARM64 cluster (they ship
+# x86_64 envoy binaries that crash under Rosetta). inferenceExtension.enabled no
+# longer exists in the 2.3.x chart.
+KGTW_VERSION=v2.3.6
+helm upgrade --install kgateway-crds oci://cr.kgateway.dev/kgateway-dev/charts/kgateway-crds --version $KGTW_VERSION --namespace kgateway-system --create-namespace
+helm upgrade --install kgateway oci://cr.kgateway.dev/kgateway-dev/charts/kgateway --version $KGTW_VERSION --namespace kgateway-system --create-namespace
 
 
 

@@ -55,12 +55,15 @@ def _run_route(
     turns,
     seed,
     kv_priority=None,
+    tool_reliability=False,
 ):
     """Drive one route with either the single-shot or the tool-calling-session workload."""
     if workload == "sessions":
         from bench.sim.workload import generate_sessions
 
-        turn_requests = generate_sessions(sessions, turns, qps, seed=seed)
+        turn_requests = generate_sessions(
+            sessions, turns, qps, seed=seed, tool_reliability=tool_reliability
+        )
         return asyncio.run(
             run_session_traffic(gateway_url, turn_requests, concurrency, route, kv_priority)
         )
@@ -98,6 +101,14 @@ def _run_route(
 )
 @click.option("--kv-ttl", default=None, help="Lease for --kv-priority, a Go duration (e.g. 3s)")
 @click.option("--kv-scope", default=None, help="Session/program scope for --kv-priority")
+@click.option(
+    "--tool-reliability",
+    is_flag=True,
+    default=False,
+    help="Model per-tool reliability in the sessions workload: gaps vary by tool and "
+    "assistant messages carry OpenAI tool_calls, giving the EPP's kv-cache-priority "
+    "plugin a tool signature to learn per-tool re-arrival gaps from (RFC-0001 §5).",
+)
 def traffic(
     route,
     requests,
@@ -111,6 +122,7 @@ def traffic(
     kv_priority,
     kv_ttl,
     kv_scope,
+    tool_reliability,
 ):
     """Run synthetic traffic generator against a specific routing strategy"""
     click.echo(
@@ -135,6 +147,7 @@ def traffic(
         turns,
         seed,
         kv_priority_header,
+        tool_reliability=tool_reliability,
     )
 
     ttfts = compute_percentiles(result.ttfts)

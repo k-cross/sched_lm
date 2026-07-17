@@ -22,6 +22,11 @@ ROUTE_HEADER = "x-llmd-route"
 # EPP work exists to inject it.
 KV_CACHE_PRIORITY_HEADER = "x-kv-cache-priority"
 
+# RFC-0001 §2 client-supplied session identity. Without it the EPP falls back to hashing
+# the conversation's opening messages, which collide across sessions that share a canned
+# opener -- concurrent sessions then pollute each other's per-tool gap statistics.
+SESSION_HEADER = "x-session-id"
+
 USER_PROMPTS = [
     "Write a short poem about the ocean.",
     "Explain quantum computing in simple terms.",
@@ -47,6 +52,7 @@ async def _stream_chat(
     result: BenchmarkResult,
     max_tokens: int = 50,
     kv_priority: str | None = None,
+    session_id: int | None = None,
 ):
     """POST a chat-completions request, timing TTFT from the first streamed chunk."""
     payload = {
@@ -58,6 +64,8 @@ async def _stream_chat(
     headers = {ROUTE_HEADER: route}
     if kv_priority is not None:
         headers[KV_CACHE_PRIORITY_HEADER] = kv_priority
+    if session_id is not None:
+        headers[SESSION_HEADER] = str(session_id)
 
     start_time = time.monotonic()
     ttft = None
@@ -69,6 +77,13 @@ async def _stream_chat(
                 return
 
             async for line in response.content:
+                # The sim reports request errors (e.g. context-length overflow) as a
+                # streaming 200 whose first data chunk is an error object -- surface
+                # them instead of scoring silent failures as successes.
+                if line.startswith(b'data: {"error"'):
+                    print(f"Request failed in-stream: {line.decode(errors='replace').strip()}")
+                    result.errors += 1
+                    return
                 if line and ttft is None:
                     ttft = time.monotonic() - start_time
                     result.ttfts.append(ttft)
@@ -164,8 +179,11 @@ async def run_session_traffic(
 
     Turns of a session are sent *sequentially* (so each turn's growing prefix can hit the
     cache the previous turn seeded), while distinct sessions run concurrently up to
-    `concurrency`. This is the live counterpart to the offline engine: the same generated
-    workload, but routed by the real EPP instead of the modeled cost function.
+    `concurrency`. Within a session, turns are paced by the workload's arrival gaps --
+    think time plus tool latency -- so a timing-observing router (the EPP's
+    kv-cache-priority plugin) sees the same re-arrival gaps the generator modeled.
+    This is the live counterpart to the offline engine: the same generated workload,
+    but routed by the real EPP instead of the modeled cost function.
     """
     result = BenchmarkResult()
 
@@ -179,9 +197,20 @@ async def run_session_traffic(
 
     async def run_one(turns: "list[TurnRequest]"):
         async with sem, aiohttp.ClientSession() as session:
+            start = time.monotonic()
+            base = turns[0].arrival
             for turn in turns:
+                delay = (turn.arrival - base) - (time.monotonic() - start)
+                if delay > 0:
+                    await asyncio.sleep(delay)
                 await _stream_chat(
-                    session, target_url, route, turn.messages, result, kv_priority=kv_priority
+                    session,
+                    target_url,
+                    route,
+                    turn.messages,
+                    result,
+                    kv_priority=kv_priority,
+                    session_id=turn.session_id,
                 )
 
     await asyncio.gather(*(run_one(turns) for turns in by_session.values()))

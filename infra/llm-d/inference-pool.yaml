@@ -46,6 +46,22 @@ spec:
             - "--inter-token-latency=10ms"
             - "--zmq-endpoint=tcp://0.0.0.0:5557"
             - "--force-dummy-tokenizer"
+            # Without the block cache the retention directives (and the pinned gauges,
+            # cached_tokens, ZMQ KV events) are all no-ops.
+            - "--enable-kvcache"
+            # The sim defaults to a 1024-token context; session turns exceed that after
+            # the first turn (the system prompt alone is ~2.5k tokens) and the sim
+            # answers a streaming 200 carrying a BadRequestError payload -- silently
+            # zero KV activity. Size the cache in blocks (of 16 tokens) accordingly.
+            - "--max-model-len=32768"
+            - "--kv-cache-size=4096"
+          env:
+            # The kv-cache subsystem refuses to start without the pod IP (used as the
+            # KV-events publisher identity).
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           ports:
             - containerPort: 8000
               name: http
@@ -78,6 +94,12 @@ spec:
 # overrides endpoint selection using ZMQ KV-cache events. This is the DEFAULT
 # route -- any request to the path that does not carry an x-llmd-route header
 # selecting another strategy lands here.
+#
+# Why a hand-rolled GatewayExtension instead of an InferencePool backendRef:
+# kgateway removed InferencePool support from the Envoy data plane in v2.2
+# (moved to agentgateway), and the v2.1.x envoy-wrapper images ship x86_64
+# binaries that crash under Rosetta on this ARM64 cluster. The EPP picks the
+# endpoint via the x-gateway-destination-endpoint header either way.
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
@@ -163,17 +185,24 @@ spec:
     grpcService:
       backendRef:
         name: gaie-epp
-        port: 9002
+        # 9005 is the values.yaml extraServicePorts entry with appProtocol h2c
+        # (same targetPort 9002); the chart's own 9002 port lacks the appProtocol
+        # and Envoy would dial it with HTTP/1.1 and reset with a protocol error.
+        # Pairs with --secure-serving=false on the EPP: plaintext h2c end to end.
+        port: 9005
     processingMode:
       requestHeaderMode: SEND
       responseHeaderMode: SEND
-      # BUFFERED, not NONE: the EPP only schedules when the request-body extProc phase
-      # arrives (llm-d-router handlers/server.go acts on RequestBody at EndOfStream).
-      # With NONE a POST never reaches scheduling at all -- and both prefix scoring and
-      # the kv-cache-priority plugin need the prompt.
-      requestBodyMode: BUFFERED
+      # FULL_DUPLEX_STREAMED, not NONE/BUFFERED: with NONE the EPP never schedules
+      # (llm-d-router only acts on the RequestBody phase); with BUFFERED, Envoy
+      # lock-steps -- it waits for a headers response before sending the body --
+      # but llm-d-router's EPP (GIE v1.5 protocol) defers the headers response
+      # until after body-driven scheduling, so the stream stalls into the message
+      # timeout and fails open. Full-duplex removes the lock-step. Envoy requires
+      # trailer mode SEND alongside it.
+      requestBodyMode: FULL_DUPLEX_STREAMED
+      requestTrailerMode: SEND
       responseBodyMode: NONE
-      requestTrailerMode: SKIP
       responseTrailerMode: SKIP
 ---
 apiVersion: gateway.kgateway.dev/v1alpha1

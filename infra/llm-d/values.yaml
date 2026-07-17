@@ -11,6 +11,12 @@ inferenceExtension:
     pullPolicy: IfNotPresent
   flags:
     v: 4 # debug logging so PreRequest plugin activity is visible during E2E
+    # The kgateway GatewayExtension dials the extProc in plaintext; the runner's default
+    # is TLS with a self-signed cert, which Envoy resets at connect (the failure is
+    # invisible under FailOpen). The chart renders flags as `--<key> "<value>"`, which
+    # breaks pflag booleans, so the k=v pair rides in the key; the runner tolerates the
+    # resulting stray empty positional arg.
+    "secure-serving=false": ""
   # The chart's defaults (cpu 4 / 8Gi) are sized for production; keep the k3d
   # footprint small.
   resources:
@@ -23,6 +29,16 @@ inferenceExtension:
     prometheus:
       auth:
         enabled: false # this bench scrapes via pod annotations, no SA-token auth
+  # A second ext-proc port whose appProtocol tells kgateway to dial the gRPC server
+  # with h2c -- the chart's built-in 9002 port carries no appProtocol, so Envoy would
+  # speak HTTP/1.1 and the stream dies with a protocol error. The GatewayExtension
+  # backendRef targets this port.
+  extraServicePorts:
+    - name: grpc-ext-proc-h2c
+      protocol: TCP
+      appProtocol: kubernetes.io/h2c
+      port: 9005
+      targetPort: 9002
   pluginsConfigFile: "kv-priority-plugins.yaml"
   pluginsCustomConfig:
     # llm-d-router config schema (llm-d.ai/v1alpha1), mirroring the module's no-P/D
