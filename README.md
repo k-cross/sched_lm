@@ -120,6 +120,8 @@ contention; the regime mix shifts from transfer to recompute as bandwidth drops.
 ```bash
 devenv shell        # first run: Nix fetches k3d/kubectl/helm/uv; KUBECONFIG → .k3d/kubeconfig.yaml
 cluster-create
+build-epp           # build and import the custom Gateway EPP image
+build-sim           # build and import the llm-d-inference-sim image
 deploy-llmd
 deploy-monitoring   # Prometheus/Grafana
 ```
@@ -203,6 +205,7 @@ To verify and compile the plugin:
 ```bash
 cd src/gateway-plugin
 go mod tidy
+go test ./...
 go build
 ```
 
@@ -231,6 +234,7 @@ EPP against `llm-d-inference-sim`; not latency, the sims run no kernels) →
 
 ```bash
 uv run pytest
+cd src/gateway-plugin && go test ./...
 uv run ruff check src/ tests/
 uv run ruff format src/ tests/
 ```

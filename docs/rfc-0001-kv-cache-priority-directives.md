@@ -330,11 +330,26 @@ Phased so each step is independently testable; EPP work is last (most uncertaint
    columns. The hint-on/off A/B harness and program-level measures (session-completion-time,
    zero-recompute rate, TTFT-by-turn) and the non-agentic throughput guardrail are **carried
    into phase 5** (see `rfc-0001-phase-3-plan.md`).
-4. **EPP emission** — custom EPP image with the `PreRequest` plugin; rewrite
-   `infra/llm-d/values.yaml` to the real GIE chart schema (current keys don't match the
-   chart and are likely inert). Discovery first: dump the live EPP config; confirm
-   whether body-NONE extProc mode starves classification (may need
-   `requestBodyMode: BUFFERED` on the class-aware route only).
+4. **EPP emission** — ✅ **done** (2026-07-17, see `rfc-0001-phase-4-plan.md`). Custom EPP
+   image (`src/gateway-plugin`): llm-d-router v0.9.2's importable runner + an out-of-tree
+   `kv-cache-priority` `PreRequest` plugin — per-tool EWMA gap index, per-conversation
+   gap observation, §5's confidence-gated emission (`50; ttl=<window>; scope=<session>`
+   on confident short gaps, `-1` for one-shots), and the §2 router-wins-downward
+   precedence over client headers. `values.yaml` rewritten to the real GIE
+   `inferencepool` v1.5.0 chart schema with an `EndpointPickerConfig` declaring the
+   plugin. Discovery confirmed body-NONE starves *everything* (the extProc had never
+   engaged; FailOpen masked it) — and the fix is `FULL_DUPLEX_STREAMED`, not BUFFERED:
+   Envoy's classic ext_proc lock-steps per message while llm-d-router defers the headers
+   response until after body-driven scheduling. Also required: plaintext h2c to the EPP
+   (`--secure-serving=false` + an `appProtocol: kubernetes.io/h2c` service port),
+   kgateway pinned v2.3.6 (v2.2 dropped Envoy-plane InferencePool backends; v2.1.x
+   images crash on ARM64), and turning on the sim's block cache
+   (`--enable-kvcache`, `POD_IP`, `--max-model-len=32768`) — without which all prior
+   in-cluster directive traffic had been silent no-ops. E2E: the EPP autonomously marked
+   200–280 HIGH blocks during a paced tool-session run and 7 evict-first blocks per
+   one-shot, with zero client-supplied directives. The EPP's endpoint *pick* is ignored
+   by the plain-Service routes (native pool routing needs an agentgateway/Istio
+   migration) — routing interactions were already deferred to v2 (§5).
 5. **Evidence + upstream feedback** — `bench report` comparing `prefix-affinity` vs
    `class-aware-reliability` on session workloads (tool-session hit rate, pinned
    gauges, pressure counter, session completion time, non-agentic regression). Post

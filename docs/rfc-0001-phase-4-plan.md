@@ -1,6 +1,12 @@
 # RFC-0001 Phase 4 — EPP emission (implementation plan)
 
-**Status:** in progress (started 2026-07-17) · **Scope this pass:** custom EPP image with a
+**Status:** ✅ done (2026-07-17) — all deliverables landed and verified E2E: the EPP
+autonomously emitted `50; ttl=~4s; scope=<session>` on warm tool turns and `-1` on
+one-shots; the sim marked 200–280 HIGH blocks live during a session run and 7
+evict-first blocks per one-shot; the router ceiling demoted a client's 100-pin on a
+one-shot. See "E2E findings" below for where reality overrode the plan (extProc needs
+FULL_DUPLEX_STREAMED, not BUFFERED; kgateway version constraints; the sim's block cache
+and context length were never enabled). · **Scope this pass:** custom EPP image with a
 `PreRequest` plugin emitting `x-kv-cache-priority`, real `inferencepool` chart values, extProc
 body-mode fix, sim-fork image pin, `workload.py` `tool_calls` emission · **RFC:**
 prototype-plan step 4 and §2/§5 of the RFC[^1].
@@ -90,7 +96,7 @@ feedback post.
   tool-role messages carry no name → last-assistant-`tool_calls` extraction with
   `"unknown-tool"` fallback.
 
-### B. Plugin library (`src/gateway-plugin/`, pure Go)
+### B. Plugin library (`src/gateway-plugin/`, pure Go) ✅ done
 
 Mirror `src/bench/sim/policies.py` semantics and constants: `alpha=0.3`, index LRU cap 512,
 `default_prior=(2.0, 16.0)`, gap-tracker cap 8192, `short_gap=3.0`, `conf_threshold=0.5`,
@@ -122,7 +128,7 @@ Mirror `src/bench/sim/policies.py` semantics and constants: `alpha=0.3`, index L
   EWMA convergence, LRU eviction at cap, `observe_gap` turn-0/cap behavior, classify ordering,
   and exact header strings from `PreRequest` on synthetic requests (incl. the no-header cases).
 
-### C. Binary + images + k3d import
+### C. Binary + images + k3d import ✅ done
 
 - `src/gateway-plugin/cmd/epp/main.go` — mirror llm-d-router's main; `fwkplugin.Register(...)`
   for both plugins before `runner.NewRunner().Run(...)`.
@@ -134,7 +140,7 @@ Mirror `src/bench/sim/policies.py` semantics and constants: `alpha=0.3`, index L
 - `devenv.nix` — new scripts `build-epp` / `build-sim`: docker build `--platform linux/arm64`
   + `k3d image import <tag> -c $K3D_CLUSTER_NAME`.
 
-### D. Infra rewrite
+### D. Infra rewrite ✅ done (see E2E findings for deltas)
 
 - `infra/llm-d/values.yaml` — full rewrite to the real chart schema (exact keys per D3):
   custom EPP image under `inferenceExtension.image.*`, `flags`, resources,
@@ -150,7 +156,7 @@ Mirror `src/bench/sim/policies.py` semantics and constants: `alpha=0.3`, index L
   session's tool) on assistant messages of tool turns; serialization-only, offline-sim
   behavior byte-identical; pytest updated.
 
-### E. Deploy + E2E
+### E. Deploy + E2E ✅ done
 
 1. `deploy-llmd`; rollout status; EPP logs show plugin instantiation incl.
    `kv-cache-priority`; InferencePool reconciled with 2 endpoints; sims run `:rfc0001`.
@@ -162,11 +168,60 @@ Mirror `src/bench/sim/policies.py` semantics and constants: `alpha=0.3`, index L
    Prometheus `vllm:kv_cache_pinned_usage_perc > 0` and `vllm:kv_cache_priority_blocks`
    nonzero; scheduling visibly engages (proves the BUFFERED flip un-starved the path).
 
-### F. Docs + close-out
+### F. Docs + close-out ✅ done
 
-RFC prototype-plan step 4 → ✅ with a dated summary (BUFFERED requirement, sim-image gap,
-chart alignment, deferred prefix-hash scope divergence); this doc's status updated as
-deliverables land.
+RFC prototype-plan step 4 → ✅ with a dated summary; this doc's status updated as
+deliverables landed.
+
+## E2E findings (2026-07-17) — where reality overrode the plan
+
+1. **`FULL_DUPLEX_STREAMED`, not `BUFFERED`.** The plan's context said BUFFERED would
+   un-starve the EPP; live, BUFFERED still stalled: Envoy's classic ext_proc lock-steps —
+   it waits for a *headers* response before sending the body — while llm-d-router's EPP
+   (GIE v1.5 protocol) defers the headers response until after body-driven scheduling
+   (`handlers/server.go` sends `reqHeaderResp` + `reqBodyResp` together after body EoS).
+   The stream hit the message timeout and failed open. `requestBodyMode:
+   FULL_DUPLEX_STREAMED` (+ `requestTrailerMode: SEND`, required by Envoy) removes the
+   lock-step; scheduling and header mutation then work end to end.
+2. **Two more extProc connect blockers, invisible under FailOpen:** the runner's default
+   `--secure-serving=true` (self-signed TLS) vs kgateway's plaintext dial ("connection
+   termination"), fixed with `--secure-serving=false` via a `flags` k=v-in-key workaround
+   (the chart renders flag values as separate args, which breaks pflag booleans); and
+   Envoy dialing the gRPC port with HTTP/1.1 ("protocol error"), fixed with an
+   `extraServicePorts` entry carrying `appProtocol: kubernetes.io/h2c` (a
+   `BackendConfigPolicy http2ProtocolOptions` does *not* work — kgateway refuses it for
+   Services without an http2 appProtocol). Net effect: **the extProc had never engaged in
+   any prior deployment of this stack** — every "EPP-routed" measurement before this
+   phase was actually kgateway's default Service load balancing.
+3. **kgateway version constraints (pinned v2.3.6):** v2.2 removed InferencePool
+   backendRef support from the Envoy data plane (moved to agentgateway), so the native
+   integration path is unavailable — and the v2.1.x `envoy-wrapper` images ship x86_64
+   envoy binaries that crash under Rosetta on this ARM64 cluster ("Failed to create
+   temporary file", ThreadContextFcntl). Consequence: the EPP's endpoint *pick*
+   (`x-gateway-destination-endpoint`) is ignored by the plain-Service routes; the header
+   *mutation* path (this phase's goal) works regardless. Native pool routing is an
+   agentgateway (or Istio) migration, deferred.
+4. **The sim's block cache was never on.** `--enable-kvcache` (plus a `POD_IP` downward
+   API env the kv subsystem requires) was missing from the deployment, so directives,
+   pinned gauges, `cached_tokens`, and ZMQ events were all no-ops in-cluster. Phases 2–3
+   E2E ran the fork out-of-cluster, masking this.
+5. **Context length silently zeroed all session traffic.** The sim's default
+   `--max-model-len=1024` is smaller than turn 1 of a session (~3.2k tokens; the system
+   prompt alone is ~2.5k). The sim answers a **streaming 200 whose first chunk is a
+   BadRequestError** — `bench traffic` scored those as successes. Fixed with
+   `--max-model-len=32768`, `--kv-cache-size=4096`, and the bench now surfaces in-band
+   stream errors as errors.
+6. **Traffic realism fixes** so the router actually has gaps to learn:
+   `run_session_traffic` paces a session's turns by the workload's arrival deltas
+   (previously back-to-back → learned gaps ≈ 30 ms), and sends `x-session-id`
+   (the derived opening-message-hash scope collides across sessions sharing a canned
+   opener — worth noting upstream as a weakness of any non-prefix-hash derived scope).
+   `bench traffic --tool-reliability` now exists so `tool_calls` reach the wire.
+7. **Follow-up for phase 5:** Prometheus has no pod-annotation scrape job in the current
+   monitoring deploy (only kube-prometheus-stack defaults), so the sim's `vllm:*` series
+   — including the pinned gauges — are not being collected; `bench metrics`/`report`
+   against Prometheus will read empty until that is fixed. Verified live at the pod
+   `/metrics` endpoints instead.
 
 ## Suggested order
 
