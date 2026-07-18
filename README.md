@@ -48,7 +48,7 @@ and the same workload generator as the live harness.
 
 **Live stack:** k3d cluster → llm-d Gateway (kgateway, Envoy) → **custom EPP**
 (`src/gateway-plugin/`: prefix-cache state + backend load + the RFC-0001
-`kv-cache-priority` retention hinter) → 2–4 forked `llm-d-inference-sim` replicas
+`kv-cache-priority` retention hinter) → 4 forked `llm-d-inference-sim` replicas
 (honor `x-kv-cache-priority`, export pinned-cache + KV-event metrics) ← `bench`
 CLI traffic generator measuring TTFT. Both custom images are built and loaded
 into k3d by the `build-epp` / `build-sim` devenv scripts before `deploy-llmd`.
@@ -174,12 +174,13 @@ Prometheus scrape interval) first.
 
 **Live-stack throughput is real, not modeled.** The offline sim happily runs
 `--qps 1000`; the live EPP does not. The EPP-backed routes apply genuine
-admission control against the 2 `llm-d-inference-sim` replicas — past their
-saturation point it sheds requests (`503`, or a reset ext_proc stream), which
-`bench` now tallies as `load shed` rather than crashing. For live runs keep
-`--qps`/`--concurrency` modest (single/low-double digits) or scale the backend:
-`kubectl scale deploy/vllm-simulators -n llm-d --replicas=4`. `round-robin`
-bypasses the EPP, so it never sheds — don't read its higher throughput as a win.
+admission control against the `llm-d-inference-sim` replicas (4 by default) —
+past their saturation point it sheds requests (`503`, or a reset ext_proc
+stream), which `bench` now tallies as `load shed` rather than crashing. For live
+runs keep `--qps`/`--concurrency` modest (single/low-double digits) or scale the
+backend further: `kubectl scale deploy/vllm-simulators -n llm-d --replicas=8`.
+`round-robin` bypasses the EPP, so it never sheds — don't read its higher
+throughput as a win.
 
 Metrics: `uv run bench metrics`.
 

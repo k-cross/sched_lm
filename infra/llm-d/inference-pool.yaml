@@ -20,7 +20,10 @@ metadata:
   name: vllm-simulators
   namespace: llm-d
 spec:
-  replicas: 2
+  # 4 replicas by default: 2 gives too little headroom and too much run-to-run
+  # variability to compare workload/timing changes meaningfully against the EPP's
+  # admission control. Scale further for high-load runs.
+  replicas: 4
   selector:
     matchLabels:
       app: vllm-sim
