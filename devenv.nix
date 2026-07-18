@@ -72,6 +72,17 @@
     sh infra/llm-d/setup.sh
   '';
 
+  scripts."build-epp".exec = ''
+    docker build --platform linux/arm64 -t sched-lm/gaie-epp:rfc0001 src/gateway-plugin
+    k3d image import sched-lm/gaie-epp:rfc0001 -c $K3D_CLUSTER_NAME
+  '';
+
+  scripts."build-sim".exec = ''
+    docker build --platform linux/arm64 -t ghcr.io/llm-d/llm-d-inference-sim:rfc0001 \
+      third_party/llm-d-inference-sim
+    k3d image import ghcr.io/llm-d/llm-d-inference-sim:rfc0001 -c $K3D_CLUSTER_NAME
+  '';
+
   scripts."lint".exec = ''
     uv run ruff check src/ tests/
   '';
@@ -96,6 +107,8 @@
     echo "  cluster-status    - Show cluster status"
     echo "  deploy-monitoring - Deploy Prometheus + Grafana via Helm"
     echo "  deploy-llmd       - Deploy the llm-d stack and simulators"
+    echo "  build-epp         - Build the custom EPP image and import it into k3d"
+    echo "  build-sim         - Build the inference-sim fork image and import it into k3d"
     echo "  lint              - Run ruff linter"
     echo "  format            - Run ruff formatter"
     echo ""

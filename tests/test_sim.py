@@ -214,6 +214,34 @@ def test_burstier_arrivals_have_higher_gap_variability():
     assert gap_cv(4.0) > gap_cv(1.0)
 
 
+def test_tool_turns_carry_openai_tool_calls():
+    # With reliability modeling on, assistant messages of tool turns carry OpenAI-spec
+    # tool_calls naming the session's tool (what a router keys per-tool gap stats on),
+    # and the tool result references the call id. RFC-0001 §5.
+    requests = generate_sessions(
+        5, turns=3, qps=50.0, block_size=BLOCK, seed=11, tool_reliability=True
+    )
+    tool_turns = [r for r in requests if r.turn_idx > 0 and r.tool_name is not None]
+    assert tool_turns
+    for r in tool_turns:
+        assistants = [m for m in r.messages if m["role"] == "assistant" and "tool_calls" in m]
+        assert assistants
+        call = assistants[-1]["tool_calls"][-1]
+        assert call["type"] == "function"
+        assert call["function"]["name"] == r.tool_name
+        tool_msgs = [m for m in r.messages if m["role"] == "tool"]
+        assert tool_msgs[-1]["tool_call_id"] == call["id"]
+
+
+def test_tool_calls_absent_without_reliability_modeling():
+    # Serialization-only change: the legacy stream (reliability off) is untouched.
+    requests = generate_sessions(3, turns=3, qps=50.0, block_size=BLOCK, seed=11)
+    for r in requests:
+        for m in r.messages:
+            assert "tool_calls" not in m
+            assert "tool_call_id" not in m
+
+
 def test_turn_prefix_grows_within_session():
     requests = generate_sessions(3, turns=5, qps=100.0, block_size=BLOCK, seed=1)
     by_session: dict[int, list[TurnRequest]] = {}

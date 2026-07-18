@@ -21,6 +21,7 @@ sender (via ``messages``).
 
 import random
 from dataclasses import dataclass, field
+from typing import Any
 
 from bench.prompt import SYSTEM_PROMPT
 from bench.sim.blocks import DEFAULT_BLOCK_SIZE, hash_blocks
@@ -102,7 +103,7 @@ class TurnRequest:
     tokens: list[int]
     block_hashes: list[int]
     gen_tokens: int
-    messages: list[dict[str, str]] = field(default_factory=list)
+    messages: list[dict[str, Any]] = field(default_factory=list)
     # Ground-truth workload class ("tool" | "rag" | "oneshot"). Used by the engine for
     # per-class metrics only -- policies never see it; they classify from observables.
     kind: str = "tool"
@@ -217,9 +218,29 @@ def generate_sessions(
 
                 segment = f"{assistant} {tool_result} {next_user}"
                 tokens = tokens + _tokenize(segment)
+                # OpenAI-spec tool_calls on the assistant message carry the tool's name to
+                # the wire, so a router can key per-tool gap stats (RFC-0001 §5). Names
+                # never enter the token stream -- the offline sim's prefixes are unchanged.
+                assistant_msg: dict[str, Any] = {"role": "assistant", "content": assistant}
+                if tool_name is not None:
+                    call_id = f"call_s{sid}_t{turn_idx}"
+                    assistant_msg["tool_calls"] = [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": tool_name, "arguments": "{}"},
+                        }
+                    ]
+                    tool_msg: dict[str, Any] = {
+                        "role": "tool",
+                        "content": tool_result,
+                        "tool_call_id": call_id,
+                    }
+                else:
+                    tool_msg = {"role": "tool", "content": tool_result}
                 messages = messages + [
-                    {"role": "assistant", "content": assistant},
-                    {"role": "tool", "content": tool_result},
+                    assistant_msg,
+                    tool_msg,
                     {"role": "user", "content": next_user},
                 ]
 

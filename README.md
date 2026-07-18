@@ -46,9 +46,12 @@ and the same workload generator as the live harness.
 
 ## Architecture
 
-**Live stack:** k3d cluster → llm-d Gateway (kgateway, Envoy) → EPP (routing
-brain: prefix-cache state + backend load) → 2–4 `llm-d-inference-sim` replicas
-(KV events + Prometheus metrics) ← `bench` CLI traffic generator measuring TTFT.
+**Live stack:** k3d cluster → llm-d Gateway (kgateway, Envoy) → **custom EPP**
+(`src/gateway-plugin/`: prefix-cache state + backend load + the RFC-0001
+`kv-cache-priority` retention hinter) → 4 forked `llm-d-inference-sim` replicas
+(honor `x-kv-cache-priority`, export pinned-cache + KV-event metrics) ← `bench`
+CLI traffic generator measuring TTFT. Both custom images are built and loaded
+into k3d by the `build-epp` / `build-sim` devenv scripts before `deploy-llmd`.
 
 **Offline simulator (`src/bench/sim/`):**
 
@@ -78,6 +81,15 @@ uv run bench simulate --nodes 4 --sessions 200 --turns 6 --qps 10
 
 Prints a comparison table across policies (round-robin, cache-local,
 transfer-aware, weighted-precise, weighted-approx, class-aware, oracle).
+
+## Workload Presets
+
+Both the online and offline scripts support a `--preset` flag to quickly trigger specific parameter profiles:
+
+- `--preset fast`: Short workload for quick verification and debugging (low QPS, few sessions).
+- `--preset experiment`: The full default experiment profile (higher QPS, realistic mix, tool reliability enabled).
+
+Explicitly setting any parameter (e.g., `--qps 50`) will override the preset's default for that parameter.
 
 ## Offline simulation
 
@@ -120,30 +132,66 @@ contention; the regime mix shifts from transfer to recompute as bandwidth drops.
 ```bash
 devenv shell        # first run: Nix fetches k3d/kubectl/helm/uv; KUBECONFIG → .k3d/kubeconfig.yaml
 cluster-create
+build-epp           # build and import the custom Gateway EPP image
+build-sim           # build and import the llm-d-inference-sim image
 deploy-llmd
 deploy-monitoring   # Prometheus/Grafana
 ```
 
 Lifecycle: `cluster-status`, `cluster-delete`.
 
-Traffic and comparison:
+The gateway has no in-cluster DNS name reachable from your Mac; point the CLI at
+its LoadBalancer IP (OrbStack/Colima assign one directly):
 
 ```bash
-uv run bench traffic --route round-robin --requests 200 --qps 10
-uv run bench traffic --route prefix-affinity --requests 200 --qps 10
-uv run bench report --compare round-robin --compare prefix-affinity --qps 10
-uv run bench report --compare round-robin --compare prefix-affinity --workload sessions --qps 10
+GW="http://$(kubectl get svc -n llm-d llmd-gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}')/v1/chat/completions"
 ```
 
-`--route` sets the `x-llmd-route` header: `round-robin` hits an HTTPRoute with
-no EPP extProc (default k8s balancing); `prefix-affinity` uses the EPP-backed
-route that steers by KV-cache state. `--qps` paces arrivals open-loop;
-`--concurrency` caps in-flight requests. `--workload sessions` replays the
-offline session generator (`--sessions`, `--turns`, `--seed`) against the real
-EPP. `report` reads the prefix-cache counter delta around each run, waiting
-`--settle` seconds (default 35, ≥ the Prometheus scrape interval) first.
+Traffic and comparison (pass `--gateway-url "$GW"`):
+
+```bash
+uv run bench traffic --route round-robin  --requests 200 --qps 10 --gateway-url "$GW"
+uv run bench traffic --route prefix-affinity --requests 200 --qps 10 --gateway-url "$GW"
+uv run bench report --compare round-robin --compare prefix-affinity --qps 10 --gateway-url "$GW"
+uv run bench report --compare round-robin --compare prefix-affinity \
+  --workload sessions --qps 10 --gateway-url "$GW"
+```
+
+`--route` sets the `x-llmd-route` header, selecting an HTTPRoute:
+- `round-robin` — no EPP extProc; kgateway's default k8s load balancing.
+- `prefix-affinity` — EPP-backed; steers by KV-cache state.
+- `class-aware-reliability` — EPP-backed; additionally emits RFC-0001
+  `x-kv-cache-priority` retention directives (see "Promoting a policy" below).
+
+`--qps` paces arrivals open-loop; `--concurrency` caps in-flight requests.
+`--workload sessions` replays the offline session generator (`--sessions`,
+`--turns`, `--seed`) against the real EPP, pacing each session's turns by the
+generated inter-turn gaps. Add `--tool-reliability` to model per-tool gaps and
+emit OpenAI `tool_calls` on the wire, so the EPP's `kv-cache-priority` plugin
+can learn per-tool re-arrival gaps. `report` reads the prefix-cache and pinned
+counter deltas around each run, waiting `--settle` seconds (default 35, ≥ the
+Prometheus scrape interval) first.
+
+**Live-stack throughput is real, not modeled.** The offline sim happily runs
+`--qps 1000`; the live EPP does not. The EPP-backed routes apply genuine
+admission control against the `llm-d-inference-sim` replicas (4 by default) —
+past their saturation point it sheds requests (`503`, or a reset ext_proc
+stream), which `bench` now tallies as `load shed` rather than crashing. For live
+runs keep `--qps`/`--concurrency` modest (single/low-double digits) or scale the
+backend further: `kubectl scale deploy/vllm-simulators -n llm-d --replicas=8`.
+`round-robin` bypasses the EPP, so it never sheds — don't read its higher
+throughput as a win.
 
 Metrics: `uv run bench metrics`.
+
+> **Known gap:** the sim pods carry `prometheus.io/scrape` annotations, but the
+> kube-prometheus-stack install doesn't scrape on those annotations without a
+> `PodMonitor` / additional scrape config, so Prometheus currently holds no
+> `vllm:*` series. `report`'s cache-hit-rate and pinned columns therefore read
+> zero, and `bench metrics` returns empty. The per-pod `/metrics` endpoints
+> themselves are correct (verify directly with a `kubectl exec … curl` against a
+> sim pod IP). Wiring up scraping is tracked for phase 5 —
+> see [`docs/rfc-0001-phase-4-plan.md`](docs/rfc-0001-phase-4-plan.md).
 
 ## Adding a policy
 
@@ -195,24 +243,49 @@ either a `Scorer` (score pods 0–1; see the
 or, better for per-class routing, a **ProfileHandler** that picks a scheduling
 profile per request.
 
-We have provided a reference implementation of this Go plugin at [src/gateway-plugin/](src/gateway-plugin/). It implements:
-- A `ToolGapIndex` for tracking request re-arrival gaps (EWMA).
-- A `ClassAwareReliability` profile handler that classifies chat requests as `tool`, `rag`, or `oneshot` and picks the correct routing profile.
+We provide a reference implementation of this Go plugin at
+[src/gateway-plugin/](src/gateway-plugin/), built into a custom EPP image
+(`cmd/epp/main.go` wraps the `llm-d-router` runner and registers the plugins).
+It implements:
+- A per-tool `ToolGapIndex` (EWMA mean+variance, LRU-bounded) and a
+  `SessionTracker` that measure per-tool re-arrival gaps from timing metadata
+  alone — mirroring `ToolGapIndex`/`observe_gap` in the offline `policies.py`.
+- A `kv-cache-priority` **`PreRequest` plugin** (RFC-0001 §5) that classifies
+  each request and injects an `x-kv-cache-priority` retention directive after
+  scheduling: `50; ttl=<window>; scope=<session>` when a confident, short return
+  is predicted, `-1` (evict-first) for one-shots, nothing otherwise. The client
+  can override direction downward (router-wins-downward precedence, §2).
+- A `class-aware-reliability` `ProfileHandler` (per-class profile selection).
+  Registered but left unwired in the shipped `EndpointPickerConfig` — the
+  minimal config runs one default profile plus the `PreRequest` plugin;
+  profile-based routing A/B is future work.
 
-To verify and compile the plugin:
+To verify and compile the plugin (and rebuild the deployed image):
 ```bash
-cd src/gateway-plugin
-go mod tidy
-go build
+cd src/gateway-plugin && go test ./... && go build ./...
+build-epp   # devenv script: docker build + k3d image import
 ```
 
-To run traffic utilizing this strategy in the live stack:
+To exercise it in the live stack:
 ```bash
-uv run bench traffic --route class-aware-reliability ...
+uv run bench traffic --route class-aware-reliability --workload sessions \
+  --tool-reliability --gateway-url "$GW" ...
 ```
-This is mapped to the `llm-route-class-aware-reliability` HTTPRoute in the gateway config.
+This maps to the `llm-route-class-aware-reliability` HTTPRoute.
 
-> **Note on Cache Pinning**: The `class-aware-reliability` plugin accurately tracks tool inter-arrival gaps (via EWMA) using traffic timing metadata. However, the upstream `llm-d-router` / Gateway API Inference Extension does not currently support explicit cache pinning directives (like `retain_until`). Thus, while the tracking logic mirrors the offline simulator perfectly, the live stack cannot currently execute the soft-pinning action on backend KV caches.
+> **Cache pinning is live (RFC-0001).** This bench forks `llm-d-inference-sim`
+> ([`third_party/`](third_party/), branch `rfc-0001-retention-directives`) to
+> honor the `x-kv-cache-priority` header with a rank-aware evictor and export
+> pinned-cache gauges (`vllm:kv_cache_pinned_usage_perc`,
+> `vllm:kv_cache_priority_blocks`, `vllm:kv_cache_pinned_evictions_total`). So
+> the live stack **does** execute the soft-pinning action the offline sim models:
+> the EPP's learned directive marks the prefix on the backend, and the sim
+> retains it under eviction pressure until the session returns. The full design,
+> its alignment with upstream [vllm#37003](https://github.com/vllm-project/vllm/issues/37003),
+> and the prototype phases live in
+> [`docs/rfc-0001-kv-cache-priority-directives.md`](docs/rfc-0001-kv-cache-priority-directives.md).
+> Deploying the fork requires `build-sim` (below) so the `:rfc0001` image is
+> loaded into k3d.
 
 **Tier 2 — a serving-stack change.** The transfer regime is not expressible in
 stock llm-d: there is no inter-replica KV-transfer path (hence the `weighted-*`
@@ -231,6 +304,7 @@ EPP against `llm-d-inference-sim`; not latency, the sims run no kernels) →
 
 ```bash
 uv run pytest
+cd src/gateway-plugin && go test ./... && go build ./...
 uv run ruff check src/ tests/
 uv run ruff format src/ tests/
 ```

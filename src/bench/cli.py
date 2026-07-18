@@ -15,6 +15,52 @@ from bench.traffic import run_session_traffic, run_traffic
 # falling back to the server's default lease.
 _GO_DURATION_RE = re.compile(r"^\d+(\.\d+)?(ns|us|µs|ms|s|m|h)([0-9.]+(ns|us|µs|ms|s|m|h))*$")
 
+ONLINE_PRESETS = {
+    "fast": {
+        "workload": "sessions",
+        "sessions": 5,
+        "turns": 3,
+        "qps": 2.0,
+        "concurrency": 2,
+    },
+    "experiment": {
+        "workload": "sessions",
+        "sessions": 50,
+        "turns": 6,
+        "qps": 10.0,
+        "concurrency": 20,
+        "tool_reliability": True,
+    },
+}
+
+OFFLINE_PRESETS = {
+    "fast": {
+        "sessions": 10,
+        "turns": 3,
+        "qps": 5.0,
+        "nodes": 2,
+    },
+    "experiment": {
+        "sessions": 200,
+        "turns": 6,
+        "qps": 10.0,
+        "mix": {"tool": 0.5, "rag": 0.3, "oneshot": 0.2},
+        "tool_reliability": True,
+        "burst_cv": 1.5,
+    },
+}
+
+
+def _apply_preset(ctx, preset: str, presets: dict):
+    if not preset:
+        return
+    p = presets.get(preset)
+    if not p:
+        return
+    for k, v in p.items():
+        if k in ctx.params and ctx.get_parameter_source(k) == click.core.ParameterSource.DEFAULT:
+            ctx.params[k] = v
+
 
 @click.group()
 def main():
@@ -55,12 +101,15 @@ def _run_route(
     turns,
     seed,
     kv_priority=None,
+    tool_reliability=False,
 ):
     """Drive one route with either the single-shot or the tool-calling-session workload."""
     if workload == "sessions":
         from bench.sim.workload import generate_sessions
 
-        turn_requests = generate_sessions(sessions, turns, qps, seed=seed)
+        turn_requests = generate_sessions(
+            sessions, turns, qps, seed=seed, tool_reliability=tool_reliability
+        )
         return asyncio.run(
             run_session_traffic(gateway_url, turn_requests, concurrency, route, kv_priority)
         )
@@ -98,7 +147,18 @@ def _run_route(
 )
 @click.option("--kv-ttl", default=None, help="Lease for --kv-priority, a Go duration (e.g. 3s)")
 @click.option("--kv-scope", default=None, help="Session/program scope for --kv-priority")
+@click.option(
+    "--tool-reliability",
+    is_flag=True,
+    default=False,
+    help="Model per-tool reliability in the sessions workload: gaps vary by tool and "
+    "assistant messages carry OpenAI tool_calls, giving the EPP's kv-cache-priority "
+    "plugin a tool signature to learn per-tool re-arrival gaps from (RFC-0001 §5).",
+)
+@click.option("--preset", type=click.Choice(["fast", "experiment"]), help="Apply preset defaults")
+@click.pass_context
 def traffic(
+    ctx,
     route,
     requests,
     qps,
@@ -111,8 +171,18 @@ def traffic(
     kv_priority,
     kv_ttl,
     kv_scope,
+    tool_reliability,
+    preset,
 ):
     """Run synthetic traffic generator against a specific routing strategy"""
+    _apply_preset(ctx, preset, ONLINE_PRESETS)
+    qps = ctx.params["qps"]
+    concurrency = ctx.params["concurrency"]
+    workload = ctx.params["workload"]
+    sessions = ctx.params["sessions"]
+    turns = ctx.params["turns"]
+    tool_reliability = ctx.params["tool_reliability"]
+
     click.echo(
         f"Starting {workload} traffic for route: {route} (qps={qps}, concurrency={concurrency})"
     )
@@ -135,12 +205,20 @@ def traffic(
         turns,
         seed,
         kv_priority_header,
+        tool_reliability=tool_reliability,
     )
 
     ttfts = compute_percentiles(result.ttfts)
     e2e = compute_percentiles(result.e2e_latencies)
 
     click.echo(f"\nCompleted {result.successes} successful requests with {result.errors} errors.")
+    if result.errors:
+        click.echo(f"  errors: {result.error_summary()}")
+        if any("load shed" in r for r in result.error_reasons):
+            click.echo(
+                "  note: the EPP-backed routes apply real admission control against the "
+                "live replicas; lower --qps or scale the sim deployment for high-load runs."
+            )
     click.echo(
         f"TTFT (s) -> p50: {ttfts.get(50, 0):.3f}, "
         f"p90: {ttfts.get(90, 0):.3f}, "
@@ -190,7 +268,10 @@ def metrics(prometheus_url):
     default=35.0,
     help="Seconds to wait after traffic for Prometheus to scrape (>= scrape interval)",
 )
+@click.option("--preset", type=click.Choice(["fast", "experiment"]), help="Apply preset defaults")
+@click.pass_context
 def report(
+    ctx,
     compare,
     requests,
     qps,
@@ -202,8 +283,17 @@ def report(
     gateway_url,
     prometheus_url,
     settle,
+    preset,
 ):
     """Run traffic against multiple routes and generate a comparison report"""
+    _apply_preset(ctx, preset, ONLINE_PRESETS)
+    requests = ctx.params["requests"]
+    qps = ctx.params["qps"]
+    concurrency = ctx.params["concurrency"]
+    workload = ctx.params["workload"]
+    sessions = ctx.params["sessions"]
+    turns = ctx.params["turns"]
+
     if not compare:
         click.echo("Please provide at least one route to compare using --compare")
         return
@@ -331,7 +421,10 @@ def _parse_mix(ctx, param, value: str) -> dict[str, float]:
     help="class-aware-reliability: keep a prefix warm for predicted_gap x this margin",
 )
 @click.option("--seed", default=0, help="Workload RNG seed")
+@click.option("--preset", type=click.Choice(["fast", "experiment"]), help="Apply preset defaults")
+@click.pass_context
 def simulate(
+    ctx,
     policies,
     nodes,
     sessions,
@@ -350,6 +443,7 @@ def simulate(
     tool_reliability,
     retain_margin,
     seed,
+    preset,
 ):
     """Offline discrete-event simulation of prefix-cache routing policies.
 
@@ -357,6 +451,15 @@ def simulate(
     node state, then compares each policy against an oracle argmin (regret) and reports the
     regime mix (wait / transfer / recompute) and how coupled decisions are to other nodes.
     """
+    _apply_preset(ctx, preset, OFFLINE_PRESETS)
+    nodes = ctx.params["nodes"]
+    sessions = ctx.params["sessions"]
+    turns = ctx.params["turns"]
+    qps = ctx.params["qps"]
+    burst_cv = ctx.params["burst_cv"]
+    mix = ctx.params["mix"]
+    tool_reliability = ctx.params["tool_reliability"]
+
     from bench.sim.cost import CostParams
     from bench.sim.engine import run_simulation
     from bench.sim.policies import build_policy

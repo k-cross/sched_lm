@@ -9,7 +9,7 @@ from bench.prompt import (
     SYSTEM_PROMPT_TARGET_TOKENS,
     _build_system_prompt,
 )
-from bench.traffic import ROUTE_HEADER, run_traffic
+from bench.traffic import ROUTE_HEADER, BenchmarkResult, run_traffic
 
 
 def test_system_prompt_is_deterministic_and_shared():
@@ -24,6 +24,18 @@ def test_system_prompt_reaches_target_size():
     # Should be at least the target and within a section of overshoot.
     assert est_tokens >= SYSTEM_PROMPT_TARGET_TOKENS
     assert est_tokens < SYSTEM_PROMPT_TARGET_TOKENS * 1.25
+
+
+def test_benchmark_result_aggregates_error_reasons():
+    result = BenchmarkResult()
+    result.record_error("load shed (503)")
+    result.record_error("load shed (503)")
+    result.record_error("in-stream error")
+
+    assert result.errors == 3
+    assert result.error_reasons["load shed (503)"] == 2
+    # most_common orders by count, so the summary leads with the dominant reason.
+    assert result.error_summary() == "2x load shed (503), 1x in-stream error"
 
 
 class _FakeResponse:

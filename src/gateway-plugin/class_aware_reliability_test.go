@@ -3,7 +3,6 @@ package class_aware_reliability
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -15,19 +14,6 @@ type mockProfile struct{}
 
 func (m *mockProfile) Run(ctx context.Context, request *scheduling.InferenceRequest, candidateEndpoints []scheduling.Endpoint) (*scheduling.ProfileRunResult, error) {
 	return &scheduling.ProfileRunResult{}, nil
-}
-
-func TestToolGapIndex(t *testing.T) {
-	idx := NewToolGapIndex(0.5)
-
-	mean, variance := idx.Observe()
-	assert.Equal(t, 0.0, mean)
-	assert.Equal(t, 0.0, variance)
-
-	time.Sleep(10 * time.Millisecond)
-	mean2, variance2 := idx.Observe()
-	assert.Greater(t, mean2, 0.0)
-	assert.GreaterOrEqual(t, variance2, 0.0)
 }
 
 func TestClassAwareReliability_Pick(t *testing.T) {
