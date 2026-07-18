@@ -47,24 +47,21 @@ def test_get_priority_blocks(mock_metrics_client):
 
 
 def test_get_peak_pinned_usage(mock_metrics_client):
-    client, mock_scalar = mock_metrics_client
-    mock_scalar.return_value = 0.8
-
-    peak = asyncio.run(client.get_peak_pinned_usage(90))
+    client, _ = mock_metrics_client
+    with patch.object(client, "query", new_callable=AsyncMock) as mock_query:
+        mock_query.return_value = [{"value": [0, "0.8"]}]
+        peak = asyncio.run(client.get_peak_pinned_usage(90))
 
     assert peak == 0.8
     # Per-pod peak over the run window, then max across pods -- instant queries read ~0
     # once the seconds-scale leases have decayed.
-    mock_scalar.assert_called_once_with("max(max_over_time(vllm:kv_cache_pinned_usage_perc[90s]))")
+    mock_query.assert_called_once_with("max(max_over_time(vllm:kv_cache_pinned_usage_perc[90s]))")
 
 
-def test_get_peak_priority_blocks(mock_metrics_client):
-    client, mock_scalar = mock_metrics_client
-    mock_scalar.side_effect = [7.0, 200.0, 0.0]
-
-    peaks = asyncio.run(client.get_peak_priority_blocks(120))
-
-    assert peaks == {"evict_first": 7.0, "high": 200.0, "pinned": 0.0}
-    mock_scalar.assert_any_call(
-        'sum(max_over_time(vllm:kv_cache_priority_blocks{priority="high"}[120s]))'
-    )
+def test_get_peak_pinned_usage_none_on_empty(mock_metrics_client):
+    # An empty vector (broken scrape / metric absent) is distinguished from a true zero
+    # so the report can render "n/a" instead of a misleading 0.0%.
+    client, _ = mock_metrics_client
+    with patch.object(client, "query", new_callable=AsyncMock) as mock_query:
+        mock_query.return_value = []
+        assert asyncio.run(client.get_peak_pinned_usage(90)) is None

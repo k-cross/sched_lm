@@ -92,21 +92,25 @@ async def _stream_chat(
     kv_priority: str | None = None,
     session_id: int | None = None,
     turn_idx: int | None = None,
-):
+) -> bool:
     """POST a chat-completions request, timing TTFT from the first streamed chunk.
 
-    When ``turn_idx`` is given (session workload), the final usage chunk is parsed and a
-    :class:`TurnMetric` is recorded, keying TTFT and prefix-cache reuse by turn position.
+    Returns ``True`` iff the request completed successfully. When ``turn_idx`` is given
+    (session workload), the final usage chunk is parsed and a :class:`TurnMetric` is
+    recorded, keying TTFT and prefix-cache reuse by turn position.
     """
-    payload = {
+    want_usage = turn_idx is not None
+    payload: dict[str, Any] = {
         "model": "Qwen/Qwen2-0.5B",
         "messages": messages,
         "stream": True,
-        # The final streamed chunk then carries usage.prompt_tokens and
-        # prompt_tokens_details.cached_tokens -- the zero-recompute ground truth.
-        "stream_options": {"include_usage": True},
         "max_tokens": max_tokens,
     }
+    if want_usage:
+        # The final streamed chunk then carries usage.prompt_tokens and
+        # prompt_tokens_details.cached_tokens -- the zero-recompute ground truth. Only
+        # requested for session turns, where a TurnMetric consumes it.
+        payload["stream_options"] = {"include_usage": True}
     headers = {ROUTE_HEADER: route}
     if kv_priority is not None:
         headers[KV_CACHE_PRIORITY_HEADER] = kv_priority
@@ -124,7 +128,7 @@ async def _stream_chat(
                 # under a qps the backend can't serve -- expected, not a client bug.
                 reason = "load shed (503)" if response.status == 503 else f"http {response.status}"
                 result.record_error(reason)
-                return
+                return False
 
             async for line in response.content:
                 # The sim reports request errors (e.g. context-length overflow) as a
@@ -132,20 +136,24 @@ async def _stream_chat(
                 # them instead of scoring silent failures as successes.
                 if line.startswith(b'data: {"error"'):
                     result.record_error("in-stream error")
-                    return
+                    return False
                 if line and ttft is None:
                     ttft = time.monotonic() - start_time
                     result.ttfts.append(ttft)
                 # Only the final chunk carries a usage object (earlier chunks serialize
-                # "usage":null), so key on its prompt_tokens field, not on "usage".
-                if line.startswith(b"data: {") and b'"prompt_tokens"' in line:
-                    chunk = json.loads(line[len(b"data: ") :])
-                    usage = chunk.get("usage") or {}
+                # "usage":null), so key on its prompt_tokens field, not on "usage". A
+                # truncated/garbled line matching the heuristic must not abort the run.
+                if want_usage and line.startswith(b"data: {") and b'"prompt_tokens"' in line:
+                    try:
+                        chunk = json.loads(line[len(b"data: ") :])
+                        usage = chunk.get("usage") or {}
+                    except json.JSONDecodeError:
+                        pass
 
             e2e = time.monotonic() - start_time
             result.e2e_latencies.append(e2e)
             result.successes += 1
-            if turn_idx is not None and session_id is not None and ttft is not None:
+            if want_usage and session_id is not None and ttft is not None:
                 details = usage.get("prompt_tokens_details") or {}
                 result.turns.append(
                     TurnMetric(
@@ -158,12 +166,14 @@ async def _stream_chat(
                         cached_tokens=details.get("cached_tokens") or 0,
                     )
                 )
+            return True
     except aiohttp.ClientPayloadError:
         # Truncated/reset response body -- the EPP resets the ext_proc stream when it
         # sheds a request mid-flight under saturation. Same root cause as a 503.
         result.record_error("load shed (stream reset)")
     except aiohttp.ClientError as e:
         result.record_error(f"transport ({type(e).__name__})")
+    return False
 
 
 async def generate_request(
@@ -272,11 +282,12 @@ async def run_session_traffic(
         async with sem, aiohttp.ClientSession() as session:
             start = time.monotonic()
             base = turns[0].arrival
+            all_ok = True
             for turn in turns:
                 delay = (turn.arrival - base) - (time.monotonic() - start)
                 if delay > 0:
                     await asyncio.sleep(delay)
-                await _stream_chat(
+                ok = await _stream_chat(
                     session,
                     target_url,
                     route,
@@ -286,9 +297,13 @@ async def run_session_traffic(
                     session_id=turn.session_id,
                     turn_idx=turn.turn_idx,
                 )
+                all_ok = all_ok and ok
             # Program completion time: first-turn dispatch -> last-turn completion,
             # scripted think-time gaps included (identical across arms by construction).
-            result.session_times[turns[0].session_id] = time.monotonic() - start
+            # Only fully-served sessions count -- a shed turn fails in ms and would bias
+            # the completion-time percentiles toward the saturated arm.
+            if all_ok:
+                result.session_times[turns[0].session_id] = time.monotonic() - start
 
     await asyncio.gather(*(run_one(turns) for turns in by_session.values()))
     result.wall_seconds = time.monotonic() - run_start

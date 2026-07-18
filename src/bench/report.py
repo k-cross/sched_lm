@@ -133,7 +133,7 @@ def generate_report(
     table.add_column("TTFT p50 (s)", justify="right", style="yellow")
     table.add_column("TTFT p99 (s)", justify="right", style="red")
     table.add_column("E2E p50 (s)", justify="right", style="yellow")
-    table.add_column("Sess p50 (s)", justify="right", style="yellow")
+    table.add_column("Sess p50/p90 (s)", justify="right", style="yellow")
     table.add_column("Zero-recomp", justify="right", style="green")
     table.add_column("Cache Hit Rate", justify="right", style="blue")
     table.add_column("Prefill (s)", justify="right", style="magenta")
@@ -155,7 +155,9 @@ def generate_report(
             f"{metrics.get('ttft_p50', 0):.3f}",
             f"{metrics.get('ttft_p99', 0):.3f}",
             f"{metrics.get('e2e_p50', 0):.3f}",
-            f"{pm.session_p50:.2f}" if pm is not None and pm.session_p50 is not None else "n/a",
+            f"{pm.session_p50:.2f}/{pm.session_p90:.2f}"
+            if pm is not None and pm.session_p50 is not None and pm.session_p90 is not None
+            else "n/a",
             f"{pm.zero_recompute_rate * 100:.0f}%"
             if pm is not None and pm.zero_recompute_rate is not None
             else "n/a",

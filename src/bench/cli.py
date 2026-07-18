@@ -320,6 +320,10 @@ def report(
     if not compare:
         click.echo("Please provide at least one route to compare using --compare")
         return
+    if len(set(compare)) != len(compare):
+        # Per-arm results are keyed by route name, so a repeated route would silently
+        # clobber the earlier arm's row. Reject it rather than drop data.
+        raise click.UsageError("--compare routes must be distinct")
 
     results = {}
     cache_hit_rates = {}

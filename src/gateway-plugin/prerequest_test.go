@@ -54,15 +54,18 @@ func ragBody() *requesthandling.InferenceRequestBody {
 }
 
 func newRequest(body *requesthandling.InferenceRequestBody, headers map[string]string) *scheduling.InferenceRequest {
-	if headers == nil {
-		headers = map[string]string{}
+	// Copy so defaulting the route never mutates a caller-shared map (a base map reused
+	// across table cases would otherwise become on-route after the first call).
+	merged := map[string]string{}
+	for k, v := range headers {
+		merged[k] = v
 	}
 	// Directive emission is route-gated; default to the on-route so existing cases
 	// exercise the emission logic. Gate tests set RouteHeader explicitly.
-	if _, ok := headers[RouteHeader]; !ok {
-		headers[RouteHeader] = DirectiveRoute
+	if _, ok := merged[RouteHeader]; !ok {
+		merged[RouteHeader] = DirectiveRoute
 	}
-	return &scheduling.InferenceRequest{RequestID: "req-1", Body: body, Headers: headers}
+	return &scheduling.InferenceRequest{RequestID: "req-1", Body: body, Headers: merged}
 }
 
 // testClock lets the tests drive the plugin's notion of time.

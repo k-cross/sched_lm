@@ -16,9 +16,8 @@ from dataclasses import dataclass
 from statistics import mean
 
 from bench.metrics import compute_percentiles
+from bench.sim.blocks import DEFAULT_BLOCK_SIZE
 from bench.traffic import BenchmarkResult, TurnMetric
-
-DEFAULT_BLOCK_SIZE = 16
 
 
 @dataclass(frozen=True)
@@ -50,9 +49,14 @@ def _zero_recompute_rate(turns: list[TurnMetric], block_size: int) -> float | No
     for session_turns in by_session.values():
         session_turns.sort(key=lambda t: t.turn_idx)
         for prev, cur in zip(session_turns, session_turns[1:], strict=False):
-            # Consecutive turns only: a gap means the earlier turn errored, and usage-less
-            # turns (prompt_tokens == 0) cannot be judged.
-            if cur.turn_idx != prev.turn_idx + 1 or prev.prompt_tokens <= 0:
+            # Consecutive turns only: a gap means the earlier turn errored. Either turn
+            # lacking a usage payload (prompt_tokens == 0) cannot be judged -- the current
+            # turn's zeroed cached_tokens would otherwise score a spurious miss.
+            if (
+                cur.turn_idx != prev.turn_idx + 1
+                or prev.prompt_tokens <= 0
+                or cur.prompt_tokens <= 0
+            ):
                 continue
             total += 1
             if cur.cached_tokens >= (prev.prompt_tokens // block_size) * block_size:
