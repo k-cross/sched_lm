@@ -50,6 +50,7 @@ OFFLINE_PRESETS = {
     },
 }
 
+
 def _apply_preset(ctx, preset: str, presets: dict):
     if not preset:
         return
@@ -211,6 +212,13 @@ def traffic(
     e2e = compute_percentiles(result.e2e_latencies)
 
     click.echo(f"\nCompleted {result.successes} successful requests with {result.errors} errors.")
+    if result.errors:
+        click.echo(f"  errors: {result.error_summary()}")
+        if any("load shed" in r for r in result.error_reasons):
+            click.echo(
+                "  note: the EPP-backed routes apply real admission control against the "
+                "live replicas; lower --qps or scale the sim deployment for high-load runs."
+            )
     click.echo(
         f"TTFT (s) -> p50: {ttfts.get(50, 0):.3f}, "
         f"p90: {ttfts.get(90, 0):.3f}, "
