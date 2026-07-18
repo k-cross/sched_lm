@@ -79,6 +79,15 @@ uv run bench simulate --nodes 4 --sessions 200 --turns 6 --qps 10
 Prints a comparison table across policies (round-robin, cache-local,
 transfer-aware, weighted-precise, weighted-approx, class-aware, oracle).
 
+## Workload Presets
+
+Both the online and offline scripts support a `--preset` flag to quickly trigger specific parameter profiles:
+
+- `--preset fast`: Short workload for quick verification and debugging (low QPS, few sessions).
+- `--preset experiment`: The full default experiment profile (higher QPS, realistic mix, tool reliability enabled).
+
+Explicitly setting any parameter (e.g., `--qps 50`) will override the preset's default for that parameter.
+
 ## Offline simulation
 
 ```bash
