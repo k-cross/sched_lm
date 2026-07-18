@@ -57,6 +57,11 @@ func newRequest(body *requesthandling.InferenceRequestBody, headers map[string]s
 	if headers == nil {
 		headers = map[string]string{}
 	}
+	// Directive emission is route-gated; default to the on-route so existing cases
+	// exercise the emission logic. Gate tests set RouteHeader explicitly.
+	if _, ok := headers[RouteHeader]; !ok {
+		headers[RouteHeader] = DirectiveRoute
+	}
 	return &scheduling.InferenceRequest{RequestID: "req-1", Body: body, Headers: headers}
 }
 
@@ -180,6 +185,37 @@ func TestPreRequestClientHeaderPrecedence(t *testing.T) {
 		p.PreRequest(context.Background(), req, nil)
 		assert.Equal(t, "100; ttl=1m", req.Headers[KVCachePriorityHeader])
 	})
+}
+
+func TestPreRequestRouteGate(t *testing.T) {
+	// Off-route requests must be fully inert: no emission (oneshots included) and no
+	// gap-index training, so the off arm of an A/B run cannot leak state into the on arm.
+	offRoutes := map[string]string{
+		"no route header":      "",
+		"prefix-affinity":      "prefix-affinity",
+		"round-robin baseline": "round-robin",
+	}
+	for name, route := range offRoutes {
+		t.Run(name, func(t *testing.T) {
+			p, clock := newTestPlugin()
+			headers := map[string]string{SessionIDHeader: "sess1", RouteHeader: route}
+
+			req := newRequest(oneshotBody(), map[string]string{RouteHeader: route})
+			p.PreRequest(context.Background(), req, nil)
+			assert.NotContains(t, req.Headers, KVCachePriorityHeader)
+
+			// Two tool turns 2 s apart would train a confident short gap on the
+			// directive route; gated, the index must stay on the default prior.
+			p.PreRequest(context.Background(), newRequest(toolTurnBody("search"), headers), nil)
+			clock.now = clock.now.Add(2 * time.Second)
+			req = newRequest(toolTurnBody("search"), headers)
+			p.PreRequest(context.Background(), req, nil)
+			assert.NotContains(t, req.Headers, KVCachePriorityHeader)
+
+			_, variance := p.index.Predict("search")
+			assert.Equal(t, DefaultPriorVar, variance, "gated traffic must not train the index")
+		})
+	}
 }
 
 func TestPreRequestUnknownToolBucket(t *testing.T) {

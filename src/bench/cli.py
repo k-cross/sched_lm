@@ -102,13 +102,24 @@ def _run_route(
     seed,
     kv_priority=None,
     tool_reliability=False,
+    session_offset=0,
 ):
-    """Drive one route with either the single-shot or the tool-calling-session workload."""
+    """Drive one route with either the single-shot or the tool-calling-session workload.
+
+    ``session_offset`` shifts session ids (and thus per-session prompt text) so multiple
+    arms of one report run replay identical arrival streams over disjoint prefixes --
+    without it, the second arm warm-starts from the first arm's cache.
+    """
     if workload == "sessions":
         from bench.sim.workload import generate_sessions
 
         turn_requests = generate_sessions(
-            sessions, turns, qps, seed=seed, tool_reliability=tool_reliability
+            sessions,
+            turns,
+            qps,
+            seed=seed,
+            tool_reliability=tool_reliability,
+            session_id_offset=session_offset,
         )
         return asyncio.run(
             run_session_traffic(gateway_url, turn_requests, concurrency, route, kv_priority)
@@ -268,6 +279,14 @@ def metrics(prometheus_url):
     default=35.0,
     help="Seconds to wait after traffic for Prometheus to scrape (>= scrape interval)",
 )
+@click.option(
+    "--tool-reliability",
+    is_flag=True,
+    default=False,
+    help="Model per-tool reliability in the sessions workload (see `bench traffic`); "
+    "required for the EPP's kv-cache-priority plugin to emit directives during a report "
+    "run -- without tool_calls on the wire it has nothing to learn per-tool gaps from.",
+)
 @click.option("--preset", type=click.Choice(["fast", "experiment"]), help="Apply preset defaults")
 @click.pass_context
 def report(
@@ -283,9 +302,12 @@ def report(
     gateway_url,
     prometheus_url,
     settle,
+    tool_reliability,
     preset,
 ):
     """Run traffic against multiple routes and generate a comparison report"""
+    from bench.program_metrics import compute_program_metrics
+
     _apply_preset(ctx, preset, ONLINE_PRESETS)
     requests = ctx.params["requests"]
     qps = ctx.params["qps"]
@@ -293,6 +315,7 @@ def report(
     workload = ctx.params["workload"]
     sessions = ctx.params["sessions"]
     turns = ctx.params["turns"]
+    tool_reliability = ctx.params["tool_reliability"]
 
     if not compare:
         click.echo("Please provide at least one route to compare using --compare")
@@ -303,10 +326,11 @@ def report(
     prefill_times = {}
     pinned_usages = {}
     pinned_evictions_map = {}
+    program_metrics = {}
 
     metrics_client = MetricsClient(prometheus_url)
 
-    for route in compare:
+    for arm_index, route in enumerate(compare):
         click.echo(f"\n--- Running traffic for route: {route} ---")
 
         # Snapshot the cumulative cache counters before this route's traffic so
@@ -315,9 +339,22 @@ def report(
         # captured the pre-traffic state -- it usually has from prior runs.
         hits_before, queries_before = asyncio.run(metrics_client.get_prefix_cache_counters())
         evictions_before = asyncio.run(metrics_client.get_pinned_evictions())
+        run_started = time.monotonic()
 
         result = _run_route(
-            route, requests, qps, concurrency, gateway_url, workload, sessions, turns, seed
+            route,
+            requests,
+            qps,
+            concurrency,
+            gateway_url,
+            workload,
+            sessions,
+            turns,
+            seed,
+            tool_reliability=tool_reliability,
+            # Same seed, disjoint session ids per arm: identical arrival streams over
+            # unique prompt text, so arm N+1 cannot replay arm N's cached prefixes.
+            session_offset=arm_index * sessions * 100,
         )
 
         ttfts = compute_percentiles(result.ttfts)
@@ -329,8 +366,11 @@ def report(
         time.sleep(settle)
         hits_after, queries_after = asyncio.run(metrics_client.get_prefix_cache_counters())
         prefill = asyncio.run(metrics_client.get_avg_prefill_time())
-        pinned_usage = asyncio.run(metrics_client.get_pinned_usage())
         evictions_after = asyncio.run(metrics_client.get_pinned_evictions())
+        # Peak over this arm's whole window (traffic + settle): EPP leases decay within
+        # seconds, so an instant post-settle gauge read would miss the run-time pressure.
+        window = int(time.monotonic() - run_started) + 1
+        pinned_peak = asyncio.run(metrics_client.get_peak_pinned_usage(window))
 
         queries_delta = queries_after - queries_before
         hits_delta = hits_after - hits_before
@@ -348,11 +388,21 @@ def report(
         }
         cache_hit_rates[route] = hit_rate
         prefill_times[route] = prefill
-        pinned_usages[route] = pinned_usage
+        pinned_usages[route] = pinned_peak
         pinned_evictions_map[route] = evictions_delta
+        program_metrics[route] = compute_program_metrics(result)
+        if result.errors:
+            click.echo(f"  errors: {result.error_summary()}")
 
     click.echo("\n")
-    generate_report(results, cache_hit_rates, prefill_times, pinned_usages, pinned_evictions_map)
+    generate_report(
+        results,
+        cache_hit_rates,
+        prefill_times,
+        pinned_usages,
+        pinned_evictions_map,
+        program_metrics,
+    )
 
 
 def _parse_mix(ctx, param, value: str) -> dict[str, float]:

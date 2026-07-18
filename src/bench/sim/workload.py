@@ -152,6 +152,7 @@ def generate_sessions(
     tool_reliability: bool = False,
     tools: list[Tool] | None = None,
     seed: int = 0,
+    session_id_offset: int = 0,
 ) -> list[TurnRequest]:
     """Generate a policy-independent stream of tool-calling turns, sorted by arrival.
 
@@ -168,6 +169,12 @@ def generate_sessions(
     outcome: a failed call returns a short error after a brief retry gap (fast retry), a success
     returns after ``think_time + tool.success_latency``. Each turn past the first records the
     tool's name as a router-observable signal; the success/failure itself is never surfaced.
+
+    ``session_id_offset`` shifts every session id (and with it every session-unique text
+    tag). Because per-session text is keyed by sid, two runs at the same seed but different
+    offsets produce identical arrival streams over *disjoint* prefixes -- the paired-arms
+    isolation the phase-5 A/B needs so one arm cannot warm-start from the other's cache.
+    Keep offsets below 1_000_000, where :func:`generate_mixed`'s rag/oneshot sid bands start.
     """
     catalog = tools if tools is not None else _DEFAULT_TOOLS
     rng = random.Random(seed)
@@ -175,7 +182,8 @@ def generate_sessions(
 
     requests: list[TurnRequest] = []
     session_start = 0.0
-    for sid in range(num_sessions):
+    for i in range(num_sessions):
+        sid = session_id_offset + i
         session_start += _arrival_gap(rng, session_rate, burst_cv)
         user0 = rng.choice(_USER_PROMPTS)
         # A session sticks to one tool (its workflow), so the most recent tool call is a

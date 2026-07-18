@@ -1,7 +1,9 @@
 import asyncio
+import json
 import random
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -36,6 +38,24 @@ USER_PROMPTS = [
 ]
 
 
+@dataclass(frozen=True)
+class TurnMetric:
+    """Per-turn observables of one successful session request (RFC-0001 phase 5, PoC 3).
+
+    Token counts come from the final streamed usage chunk (``stream_options.include_usage``);
+    ``cached_tokens`` is the server-reported prefix-cache reuse, the ground truth behind the
+    zero-recompute rate. All three are 0 when the backend sent no usage payload.
+    """
+
+    session_id: int
+    turn_idx: int
+    ttft: float
+    e2e: float
+    prompt_tokens: int
+    completion_tokens: int
+    cached_tokens: int
+
+
 class BenchmarkResult:
     def __init__(self):
         self.ttfts: list[float] = []
@@ -45,6 +65,13 @@ class BenchmarkResult:
         # Failures aggregated by reason so a run against a saturated backend prints one
         # tally instead of a line per dropped request. See error_summary().
         self.error_reasons: Counter[str] = Counter()
+        # Session-workload extras: one TurnMetric per successful turn, per-session wall
+        # time (first-turn dispatch -> last-turn completion), and the whole run's wall
+        # clock (for achieved-throughput reporting). Empty/zero for single-shot runs
+        # except wall_seconds.
+        self.turns: list[TurnMetric] = []
+        self.session_times: dict[int, float] = {}
+        self.wall_seconds: float = 0.0
 
     def record_error(self, reason: str) -> None:
         self.errors += 1
@@ -64,12 +91,20 @@ async def _stream_chat(
     max_tokens: int = 50,
     kv_priority: str | None = None,
     session_id: int | None = None,
+    turn_idx: int | None = None,
 ):
-    """POST a chat-completions request, timing TTFT from the first streamed chunk."""
+    """POST a chat-completions request, timing TTFT from the first streamed chunk.
+
+    When ``turn_idx`` is given (session workload), the final usage chunk is parsed and a
+    :class:`TurnMetric` is recorded, keying TTFT and prefix-cache reuse by turn position.
+    """
     payload = {
         "model": "Qwen/Qwen2-0.5B",
         "messages": messages,
         "stream": True,
+        # The final streamed chunk then carries usage.prompt_tokens and
+        # prompt_tokens_details.cached_tokens -- the zero-recompute ground truth.
+        "stream_options": {"include_usage": True},
         "max_tokens": max_tokens,
     }
     headers = {ROUTE_HEADER: route}
@@ -80,6 +115,7 @@ async def _stream_chat(
 
     start_time = time.monotonic()
     ttft = None
+    usage: dict[str, Any] = {}
 
     try:
         async with session.post(url, json=payload, headers=headers) as response:
@@ -100,10 +136,28 @@ async def _stream_chat(
                 if line and ttft is None:
                     ttft = time.monotonic() - start_time
                     result.ttfts.append(ttft)
+                # Only the final chunk carries a usage object (earlier chunks serialize
+                # "usage":null), so key on its prompt_tokens field, not on "usage".
+                if line.startswith(b"data: {") and b'"prompt_tokens"' in line:
+                    chunk = json.loads(line[len(b"data: ") :])
+                    usage = chunk.get("usage") or {}
 
             e2e = time.monotonic() - start_time
             result.e2e_latencies.append(e2e)
             result.successes += 1
+            if turn_idx is not None and session_id is not None and ttft is not None:
+                details = usage.get("prompt_tokens_details") or {}
+                result.turns.append(
+                    TurnMetric(
+                        session_id=session_id,
+                        turn_idx=turn_idx,
+                        ttft=ttft,
+                        e2e=e2e,
+                        prompt_tokens=usage.get("prompt_tokens") or 0,
+                        completion_tokens=usage.get("completion_tokens") or 0,
+                        cached_tokens=details.get("cached_tokens") or 0,
+                    )
+                )
     except aiohttp.ClientPayloadError:
         # Truncated/reset response body -- the EPP resets the ext_proc stream when it
         # sheds a request mid-flight under saturation. Same root cause as a 503.
@@ -181,6 +235,8 @@ async def run_traffic(
         if tasks:
             await asyncio.gather(*tasks)
 
+        result.wall_seconds = time.monotonic() - start
+
     return result
 
 
@@ -210,6 +266,7 @@ async def run_session_traffic(
         turns.sort(key=lambda r: r.turn_idx)
 
     sem = asyncio.Semaphore(concurrency)
+    run_start = time.monotonic()
 
     async def run_one(turns: "list[TurnRequest]"):
         async with sem, aiohttp.ClientSession() as session:
@@ -227,7 +284,12 @@ async def run_session_traffic(
                     result,
                     kv_priority=kv_priority,
                     session_id=turn.session_id,
+                    turn_idx=turn.turn_idx,
                 )
+            # Program completion time: first-turn dispatch -> last-turn completion,
+            # scripted think-time gaps included (identical across arms by construction).
+            result.session_times[turns[0].session_id] = time.monotonic() - start
 
     await asyncio.gather(*(run_one(turns) for turns in by_session.values()))
+    result.wall_seconds = time.monotonic() - run_start
     return result

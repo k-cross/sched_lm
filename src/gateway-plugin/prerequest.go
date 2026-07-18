@@ -27,6 +27,16 @@ const (
 	HighPriority          = 50
 )
 
+// RouteHeader selects the gateway routing strategy (see infra/llm-d/inference-pool.yaml).
+// Directive emission is gated on DirectiveRoute so `prefix-affinity` runs the identical
+// data path with directives off -- the hint-on/off A/B arm of RFC-0001 phase 5. With
+// kgateway ignoring endpoint picks, the directive header is the only live difference
+// between the two routes.
+const (
+	RouteHeader    = "x-llmd-route"
+	DirectiveRoute = "class-aware-reliability"
+)
+
 // Retention decision defaults, mirroring ClassAwareReliability in
 // src/bench/sim/policies.py.
 const (
@@ -107,6 +117,11 @@ func (p *KVCachePriority) TypedName() plugin.TypedName {
 // request.Headers propagates to the backend via the extProc HeaderMutation.
 func (p *KVCachePriority) PreRequest(ctx context.Context, request *scheduling.InferenceRequest, _ *scheduling.SchedulingResult) {
 	if request == nil || request.Headers == nil {
+		return
+	}
+	// Off-route requests are fully inert: no emission and no gap-index training, so the
+	// off arm of an A/B run cannot leak learned state into the on arm.
+	if request.Headers[RouteHeader] != DirectiveRoute {
 		return
 	}
 	directive, ok := p.decide(request)

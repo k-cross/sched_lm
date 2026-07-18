@@ -1,4 +1,8 @@
 prometheus:
+  # Expose Prometheus via NodePort 30090
+  service:
+    type: NodePort
+    nodePort: 30090
   prometheusSpec:
     serviceMonitorSelectorNilUsesHelmValues: false
     podMonitorSelectorNilUsesHelmValues: false
@@ -37,9 +41,3 @@ grafana:
 
 alertmanager:
   enabled: false
-
-# Expose Prometheus via NodePort 30090
-prometheus:
-  service:
-    type: NodePort
-    nodePort: 30090

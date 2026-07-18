@@ -194,6 +194,27 @@ def test_workload_is_deterministic_for_seed():
     assert [r.block_hashes for r in a] == [r.block_hashes for r in b]
 
 
+def test_session_id_offset_shifts_ids_but_not_arrivals():
+    # Same seed, different offset: identical arrival stream (paired A/B arms), shifted
+    # session ids, and disjoint per-session text -- so a second arm cannot warm-start
+    # from the first arm's cache. Offset 0 must reproduce the original stream exactly.
+    base = generate_sessions(8, turns=3, qps=5.0, block_size=BLOCK, seed=7)
+    zero = generate_sessions(8, turns=3, qps=5.0, block_size=BLOCK, seed=7, session_id_offset=0)
+    off = generate_sessions(8, turns=3, qps=5.0, block_size=BLOCK, seed=7, session_id_offset=500)
+
+    assert [(r.arrival, r.session_id, r.block_hashes) for r in base] == [
+        (r.arrival, r.session_id, r.block_hashes) for r in zero
+    ]
+    assert [r.arrival for r in base] == [r.arrival for r in off]
+    assert [r.session_id + 500 for r in base] == [r.session_id for r in off]
+    assert [r.conversation_id + 500 for r in base] == [r.conversation_id for r in off]
+    # Turn-1+ prefixes diverge (session-tagged text); the shared system-prompt blocks of
+    # turn 0 stay common by design.
+    for a, b in zip(base, off, strict=True):
+        if a.turn_idx > 0:
+            assert a.block_hashes != b.block_hashes
+
+
 def test_burst_cv_one_reproduces_the_poisson_stream():
     # burst_cv=1.0 must be byte-identical to the pre-knob Poisson path so existing
     # seeded experiments stay reproducible.

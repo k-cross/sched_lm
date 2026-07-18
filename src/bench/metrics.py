@@ -79,6 +79,32 @@ class MetricsClient:
         """
         return await self._scalar("sum(vllm:kv_cache_pinned_evictions_total)")
 
+    async def get_peak_pinned_usage(self, range_seconds: int) -> float:
+        """Peak pinned-usage fraction over the last ``range_seconds`` (0–1).
+
+        EPP-emitted leases are seconds-scale, so an instant query after the settle wait
+        reads post-decay ~0; ``max_over_time`` over the run window catches the pressure
+        while traffic was live. Per-pod peak, then max across pods: the report's question
+        is "how hard was the most-pressured sim pinned", not a fleet average.
+        """
+        return await self._scalar(
+            f"max(max_over_time(vllm:kv_cache_pinned_usage_perc[{range_seconds}s]))"
+        )
+
+    async def get_peak_priority_blocks(self, range_seconds: int) -> dict[str, float]:
+        """Peak per-priority-band resident block counts over the last ``range_seconds``.
+
+        Same decay rationale as :meth:`get_peak_pinned_usage`; summed over sims after
+        taking each pod's own peak, so it is an upper bound on simultaneous residency.
+        """
+        out: dict[str, float] = {}
+        for band in ("evict_first", "high", "pinned"):
+            out[band] = await self._scalar(
+                f'sum(max_over_time(vllm:kv_cache_priority_blocks{{priority="{band}"}}'
+                f"[{range_seconds}s]))"
+            )
+        return out
+
     async def get_priority_blocks(self) -> dict[str, float]:
         """Per-priority-band resident block counts summed over all sims."""
         evict_first = await self._scalar(
