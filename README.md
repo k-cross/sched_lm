@@ -182,16 +182,15 @@ backend further: `kubectl scale deploy/vllm-simulators -n llm-d --replicas=8`.
 `round-robin` bypasses the EPP, so it never sheds — don't read its higher
 throughput as a win.
 
-Metrics: `uv run bench metrics`.
-
-> **Known gap:** the sim pods carry `prometheus.io/scrape` annotations, but the
-> kube-prometheus-stack install doesn't scrape on those annotations without a
-> `PodMonitor` / additional scrape config, so Prometheus currently holds no
-> `vllm:*` series. `report`'s cache-hit-rate and pinned columns therefore read
-> zero, and `bench metrics` returns empty. The per-pod `/metrics` endpoints
-> themselves are correct (verify directly with a `kubectl exec … curl` against a
-> sim pod IP). Wiring up scraping is tracked for phase 5 —
-> see [`docs/rfc-0001-phase-4-plan.md`](docs/rfc-0001-phase-4-plan.md).
+Metrics: `uv run bench metrics`. `deploy-monitoring` installs an
+annotation-based scrape job (`infra/monitoring/prometheus-values.yaml`,
+`prometheusSpec.additionalScrapeConfigs`) that discovers the sim pods by their
+`prometheus.io/scrape` annotations, so Prometheus collects the `vllm:*` series
+(prefix-cache counters and the RFC-0001 pinned gauges). `report` reads those
+around each run; on the session workload with `--tool-reliability` it also
+prints per-turn TTFT, zero-recompute rate, and the peak pinned-usage the EPP's
+retention directives drive — see the phase-5 evidence in
+[`docs/rfc-0001-upstream-feedback.md`](docs/rfc-0001-upstream-feedback.md).
 
 ## Adding a policy
 

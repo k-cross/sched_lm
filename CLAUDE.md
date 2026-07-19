@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Run Python CLI via `uv run`, never `python -m`: `uv run bench traffic|metrics|report ...` (entry point is `bench.cli:main`).
 - Lint: `uv run ruff check src/ tests/` — Format: `uv run ruff format src/ tests/`.
-- Cluster lifecycle (devenv scripts): `cluster-create`, `cluster-delete`, `cluster-status`, `deploy-monitoring`, `deploy-llmd`.
+- Cluster lifecycle (devenv scripts): `cluster-create`, `cluster-delete`, `cluster-status`, `deploy-monitoring`, `deploy-llmd`. Image build+import: `build-epp` (custom Gateway EPP), `build-sim` (llm-d-inference-sim fork).
 
 ## Code style
 
