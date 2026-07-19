@@ -5,7 +5,7 @@ import time
 import click
 
 from bench.metrics import MetricsClient, compute_percentiles
-from bench.report import generate_report, generate_sim_report
+from bench.report import RouteReport, generate_report, generate_sim_report
 from bench.sim.policies import DEFAULT_RETAIN_MARGIN, POLICY_NAMES, uses_belady
 from bench.sim.priority import MAX_PRIORITY, MIN_PRIORITY
 from bench.traffic import run_session_traffic, run_traffic
@@ -325,12 +325,7 @@ def report(
         # clobber the earlier arm's row. Reject it rather than drop data.
         raise click.UsageError("--compare routes must be distinct")
 
-    results = {}
-    cache_hit_rates = {}
-    prefill_times = {}
-    pinned_usages = {}
-    pinned_evictions_map = {}
-    program_metrics = {}
+    reports: dict[str, RouteReport] = {}
 
     metrics_client = MetricsClient(prometheus_url)
 
@@ -342,7 +337,7 @@ def report(
         # rate() window that mixes both routes. Requires a scrape to have
         # captured the pre-traffic state -- it usually has from prior runs.
         hits_before, queries_before = asyncio.run(metrics_client.get_prefix_cache_counters())
-        evictions_before = asyncio.run(metrics_client.get_pinned_evictions())
+        pinned_evict_before = asyncio.run(metrics_client.get_pinned_evictions())
         run_started = time.monotonic()
 
         result = _run_route(
@@ -370,43 +365,40 @@ def report(
         time.sleep(settle)
         hits_after, queries_after = asyncio.run(metrics_client.get_prefix_cache_counters())
         prefill = asyncio.run(metrics_client.get_avg_prefill_time())
-        evictions_after = asyncio.run(metrics_client.get_pinned_evictions())
+        pinned_evict_after = asyncio.run(metrics_client.get_pinned_evictions())
         # Peak over this arm's whole window (traffic + settle): EPP leases decay within
-        # seconds, so an instant post-settle gauge read would miss the run-time pressure.
+        # seconds, and cache usage swings with in-flight requests, so an instant
+        # post-settle gauge read would miss the run-time pressure. Evictions use
+        # increase() over the same window (reset-safe across sim pod restarts).
         window = int(time.monotonic() - run_started) + 1
         pinned_peak = asyncio.run(metrics_client.get_peak_pinned_usage(window))
+        cache_peak = asyncio.run(metrics_client.get_peak_cache_usage(window))
+        evictions = asyncio.run(metrics_client.get_evictions(window))
 
         queries_delta = queries_after - queries_before
         hits_delta = hits_after - hits_before
         hit_rate = hits_delta / queries_delta if queries_delta > 0 else 0.0
-        evictions_delta = evictions_after - evictions_before
+        total = result.successes + result.errors
 
-        results[route] = {
-            "requests": result.successes + result.errors,
-            "success_rate": (result.successes / (result.successes + result.errors) * 100)
-            if (result.successes + result.errors) > 0
-            else 0,
-            "ttft_p50": ttfts.get(50, 0),
-            "ttft_p99": ttfts.get(99, 0),
-            "e2e_p50": e2e.get(50, 0),
-        }
-        cache_hit_rates[route] = hit_rate
-        prefill_times[route] = prefill
-        pinned_usages[route] = pinned_peak
-        pinned_evictions_map[route] = evictions_delta
-        program_metrics[route] = compute_program_metrics(result)
+        reports[route] = RouteReport(
+            requests=total,
+            success_rate=(result.successes / total * 100) if total > 0 else 0.0,
+            ttft_p50=ttfts.get(50, 0),
+            ttft_p99=ttfts.get(99, 0),
+            e2e_p50=e2e.get(50, 0),
+            cache_hit_rate=hit_rate,
+            prefill=prefill,
+            cache_peak=cache_peak,
+            evictions=evictions,
+            pinned_peak=pinned_peak,
+            pinned_evictions=pinned_evict_after - pinned_evict_before,
+            program=compute_program_metrics(result),
+        )
         if result.errors:
             click.echo(f"  errors: {result.error_summary()}")
 
     click.echo("\n")
-    generate_report(
-        results,
-        cache_hit_rates,
-        prefill_times,
-        pinned_usages,
-        pinned_evictions_map,
-        program_metrics,
-    )
+    generate_report(reports)
 
 
 def _parse_mix(ctx, param, value: str) -> dict[str, float]:

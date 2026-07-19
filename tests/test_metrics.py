@@ -65,3 +65,25 @@ def test_get_peak_pinned_usage_none_on_empty(mock_metrics_client):
     with patch.object(client, "query", new_callable=AsyncMock) as mock_query:
         mock_query.return_value = []
         assert asyncio.run(client.get_peak_pinned_usage(90)) is None
+
+
+def test_get_peak_cache_usage(mock_metrics_client):
+    client, _ = mock_metrics_client
+    with patch.object(client, "query", new_callable=AsyncMock) as mock_query:
+        mock_query.return_value = [{"value": [0, "0.62"]}]
+        peak = asyncio.run(client.get_peak_cache_usage(120))
+
+    assert peak == 0.62
+    mock_query.assert_called_once_with("max(max_over_time(vllm:kv_cache_usage_perc[120s]))")
+
+
+def test_get_evictions(mock_metrics_client):
+    client, mock_scalar = mock_metrics_client
+    mock_scalar.return_value = 3792.0
+
+    evictions = asyncio.run(client.get_evictions(150))
+
+    assert evictions == 3792.0
+    # increase() over the window corrects for per-series counter resets (sim pods
+    # OOM-restart under the cache pressure that produces evictions).
+    mock_scalar.assert_called_once_with("sum(increase(vllm:kv_cache_evictions_total[150s]))")

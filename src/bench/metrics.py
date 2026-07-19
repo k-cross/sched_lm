@@ -79,25 +79,43 @@ class MetricsClient:
         """
         return await self._scalar("sum(vllm:kv_cache_pinned_evictions_total)")
 
-    async def get_peak_pinned_usage(self, range_seconds: int) -> float | None:
-        """Peak pinned-usage fraction over the last ``range_seconds`` (0–1), or None.
+    async def get_evictions(self, range_seconds: int) -> float:
+        """Total blocks evicted to make space (any band) over the last ``range_seconds``.
 
-        EPP-emitted leases are seconds-scale, so an instant query after the settle wait
-        reads post-decay ~0; ``max_over_time`` over the run window catches the pressure
-        while traffic was live. Per-pod peak, then max across pods: the report's question
-        is "how hard was the most-pressured sim pinned", not a fleet average. Returns None
-        when the query has no samples in the window (broken scrape / metric absent), so the
-        report can show "n/a" rather than a 0.0% that reads as "directives had no effect".
+        The direct cache-contention / eviction-pressure signal (RFC-0001 §4) -- unlike
+        :meth:`get_pinned_evictions`, which counts only the marked-and-unexpired subset.
+        Uses ``increase()`` rather than a before/after snapshot delta: under the cache
+        pressure that produces evictions, memory-limited sim pods can OOM-restart mid-run
+        and reset the counter, which would make a raw ``sum`` delta go negative;
+        ``increase()`` corrects for per-series counter resets.
         """
-        results = await self.query(
-            f"max(max_over_time(vllm:kv_cache_pinned_usage_perc[{range_seconds}s]))"
-        )
+        return await self._scalar(f"sum(increase(vllm:kv_cache_evictions_total[{range_seconds}s]))")
+
+    async def _peak_gauge(self, metric: str, range_seconds: int) -> float | None:
+        """Peak of a per-pod gauge over ``range_seconds`` (max-over-time, then max across
+        pods), or None when the window holds no samples.
+
+        Instant reads after the settle wait can miss transient pressure (pinned leases
+        decay in seconds; cache usage swings with in-flight requests), so the report reads
+        the window peak. None (vs 0.0) distinguishes a broken scrape / absent metric from a
+        genuine idle cache, so the report can render "n/a" instead of a misleading 0%.
+        """
+        results = await self.query(f"max(max_over_time({metric}[{range_seconds}s]))")
         if not results:
             return None
         try:
             return float(results[0].get("value", [0, "0"])[1])
         except (ValueError, IndexError):
             return None
+
+    async def get_peak_pinned_usage(self, range_seconds: int) -> float | None:
+        """Peak fraction of cache held by marked-and-unexpired blocks over the window (0–1)."""
+        return await self._peak_gauge("vllm:kv_cache_pinned_usage_perc", range_seconds)
+
+    async def get_peak_cache_usage(self, range_seconds: int) -> float | None:
+        """Peak overall KV-cache utilization over the window (0–1) -- how full the cache
+        got, the contention level the eviction counter is the churn side of."""
+        return await self._peak_gauge("vllm:kv_cache_usage_perc", range_seconds)
 
     async def get_priority_blocks(self) -> dict[str, float]:
         """Per-priority-band resident block counts summed over all sims."""
