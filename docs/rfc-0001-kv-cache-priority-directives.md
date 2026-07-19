@@ -350,10 +350,21 @@ Phased so each step is independently testable; EPP work is last (most uncertaint
    one-shot, with zero client-supplied directives. The EPP's endpoint *pick* is ignored
    by the plain-Service routes (native pool routing needs an agentgateway/Istio
    migration) — routing interactions were already deferred to v2 (§5).
-5. **Evidence + upstream feedback** — `bench report` comparing `prefix-affinity` vs
-   `class-aware-reliability` on session workloads (tool-session hit rate, pinned
-   gauges, pressure counter, session completion time, non-agentic regression). Post
-   results + the §7 divergence list to #37003 while its feedback window is open.
+5. **Evidence + upstream feedback** — ✅ **done** (2026-07-18, see
+   `rfc-0001-phase-5-plan.md`). `bench report` gained a hint-on/off A/B (directive
+   emission route-gated in the EPP plugin so `prefix-affinity` runs the identical path
+   with directives off), the PoC-3 program measures (TTFT-by-turn, session completion
+   time, zero-recompute rate), peak (`max_over_time`) pinned queries, and the Prometheus
+   pod-annotation scrape fix (a duplicate-key bug had been silently dropping the job).
+   Evidence[^13]: the mechanism runs end-to-end (on-arm pins 6.1–6.6% of cache, off-arm
+   0%, no client directives), but on this workload retention gives **no** reuse benefit
+   — the EPP pins short-gap sessions LRU already keeps warm, so zero-recompute is flat
+   across arms — and under cache pressure it reproduces the over-pinning collapse
+   (pins 52%, success 100%→89%, throughput 2.5→1.7). The non-agentic guardrail shows
+   zero overhead. Results + the §7 divergence list are written up in
+   `rfc-0001-upstream-feedback.md`, ready to post to #37003. Caveat: the sim's TTFT is a
+   fixed latency model, so this testbed measures cache occupancy and the over-pinning
+   failure mode, not the latency win of prefix reuse.
 
 ## Open questions (iterate here)
 
@@ -424,3 +435,6 @@ Phased so each step is independently testable; EPP work is last (most uncertaint
 [^12]: `docs/policies.md` §"Known issue — over-pinning under moderate cache pressure",
     reproducible via `bench simulate` with 3 nodes, `--cache-blocks 200`,
     `--mix tool=1.0`, `--tool-reliability --seed 21`.
+[^13]: [`rfc-0001-upstream-feedback.md`](./rfc-0001-upstream-feedback.md) — the phase-5
+    A/B evidence (session, cache-pressure, and non-agentic guardrail runs) and the
+    #37003 comment draft.

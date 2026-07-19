@@ -1,6 +1,14 @@
 # RFC-0001 Phase 5 — Evidence + upstream feedback (implementation plan)
 
-**Status:** 🚧 in progress (started 2026-07-18) · **Scope this pass:** hint-on/off A/B via a
+**Status:** ✅ done (2026-07-18) — all deliverables A–F landed; evidence and the #37003
+comment draft are in `rfc-0001-upstream-feedback.md`. Headline: the router-side retention
+path runs end-to-end (on-arm pins 6.1–6.6% of cache with zero client directives, off-arm
+0%), but on this workload it gives no reuse benefit (the EPP pins short-gap sessions LRU
+already retains, so zero-recompute is flat across arms) and under cache pressure reproduces
+the over-pinning collapse (pins 52%, success 100%→89%). The non-agentic guardrail shows no
+overhead. A code-review pass hardened the instrumentation (usage-parse no longer aborts a
+run on a malformed chunk; session-completion time counts only fully-served sessions;
+peak-pinned reads None-vs-0.0% honestly). · **Scope this pass:** hint-on/off A/B via a
 route gate in the EPP plugin, PoC-3 program-level measures (TTFT-by-turn-position, session
 completion time, zero-recompute rate, non-agentic throughput guardrail), the Prometheus
 pod-annotation scrape fix, peak (`max_over_time`) pinned queries, evidence runs, and the
