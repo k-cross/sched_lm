@@ -53,7 +53,13 @@ server-reported `cached_tokens` cover the previous turn's whole prompt, block-al
 excluded because the sim never generated it. **Pinned peak %** = `max_over_time` of the
 per-pod pinned-usage gauge over the run window (EPP leases decay in seconds, so an instant
 read is ~0). **Session p50/p90** = wall time from a session's first-turn dispatch to
-last-turn completion, counting only fully-served sessions.
+last-turn completion, counting only fully-served sessions. **Cache peak %** =
+`max_over_time` of overall KV-cache utilization over the window (how full/contended the
+cache got). **Evictions** = `sum(increase(vllm:kv_cache_evictions_total[window]))` — every
+block evicted to make space for a new one, across all priority bands; `increase()` corrects
+for the counter resets caused by memory-limited sim pods OOM-restarting under pressure.
+`vllm:kv_cache_evictions_total` was added to the fork for this evidence (the direct
+eviction-pressure signal, distinct from the pinned-eviction subset).
 
 Reproduce:
 
@@ -80,29 +86,47 @@ The mechanism works end-to-end: the on-arm pins 6.1–6.6% of cache while the of
 exactly 0%, with no client-supplied directives anywhere. But **retention delivers no
 reuse benefit on this workload** — zero-recompute is statistically indistinguishable
 between arms (24–27% both), and per-turn `cached_tokens` coverage is ~88–100% on *both*
-arms. The reason is structural, not a bug: the EPP only pins sessions whose predicted
-re-arrival gap is confidently **short** (< 3 s), and those are exactly the sessions a plain
-LRU already keeps warm. The directive re-states what LRU would do for free, so it changes
-occupancy accounting without changing outcomes — while adding tail latency (on-arm TTFT p99
-0.9–6.9 s vs off-arm ≤ 0.08 s) and a 1–3% success-rate cost from the extra work.
+arms. **The eviction counter (added after these three seeds, confirmed on a seed-0 repeat)
+reads 0 on both arms with a cache peak of ~5.5%**: the working set never fills a 4096-block
+cache, so nothing is evicted and there is simply nothing for retention to protect. The
+directive re-states what LRU would do for free, changing occupancy accounting without
+changing outcomes — while adding tail latency (on-arm TTFT p99 0.9–6.9 s vs off-arm
+≤ 0.08 s) and a 1–3% success-rate cost from the extra work.
 
-### 2. Session A/B under cache pressure (512 blocks/pod), seed 0
+### 2. Session A/B under cache pressure (512 blocks/pod), 3 seeds
 
-| arm | success | req/s | TTFT p99 | zero-recomp | pinned peak % | high-band peak blocks |
-|---|--:|--:|--:|--:|--:|--:|
-| prefix-affinity | 100.0% | 2.5 | 0.078 | 23% | 0.0% | 0 |
-| class-aware | 88.7% | 1.7 | 13.637 | 25% | 51.8% | 946 |
+Shrinking the cache to 512 blocks/pod forces real eviction, so the eviction and
+contention counters become meaningful:
 
-Shrinking the cache to force evictions is where the failure mode appears. The on-arm pins
-**51.8%** of cache (946 high-priority blocks, ~46% of the 2048-block fleet), its success
-rate collapses to **88.7%** (28 HTTP 504s), and throughput drops to 1.7 vs 2.5 req/s — with
-zero-recompute still flat (25% vs 23%). Aggressive pinning starves non-pinned traffic
-without a compensating hit-rate gain: the pinned blocks protect short-gap prefixes LRU would
-have retained anyway, and crowd out everything else. This reproduces, end-to-end, the
-**over-pinning under moderate cache pressure** that the offline sim already documents as a
-known failure mode[^4]. (The `pinned_evictions` counter stayed 0 here because the sim sheds
-via 504 before it must evict one live pin to admit another; the offline model, which forces
-the admit, is where that counter lights up.)
+| seed | arm | success | zero-recomp | cache peak % | evictions | pinned peak % |
+|---|---|--:|--:|--:|--:|--:|
+| 0 | prefix-affinity | 99.7% | 25% | 44.7% | 3650 | 0.0% |
+| 0 | class-aware | 97.0% | 35% | 44.7% | 1689 | 49.6% |
+| 1 | prefix-affinity | 100.0% | 24% | 44.3% | 3600 | 0.0% |
+| 1 | class-aware | 96.3% | 25% | 43.8% | 3007 | 47.7% |
+| 2 | prefix-affinity | 95.0% | 33% | 42.4% | 1424 | 0.0% |
+| 2 | class-aware | 98.7% | 25% | 45.9% | 3773 | 61.5% |
+| — | **prefix-affinity mean** | 98.2% | 27% | 43.8% | **2891** | 0.0% |
+| — | **class-aware mean** | 97.3% | 28% | 44.9% | **2823** | 52.9% |
+
+This is the direct measurement the earlier evidence could only infer. The on-arm pins
+**~53%** of the cache, yet **total eviction churn (~2.8 k, means within 2%) and zero-recompute
+(~27–28%) are statistically identical to the off-arm** — with large per-seed variance
+(evictions swing 1.4 k–3.8 k on *both* arms, driven by which memory-limited sim pods
+OOM-restart). Pinning half the cache neither reduces eviction pressure nor improves reuse:
+the pins protect the confidently-short-gap prefixes an LRU already retains, while the churn
+from the non-reused working set is unaffected. (One seed showed the on-arm evicting far
+*less* — 1689 vs 3650 — which looked like a halving until the other two seeds cancelled it;
+the counter's value here is precisely that it exposed the variance rather than letting a
+lucky seed stand.) Cache-peak parity (~44% both) confirms the contention level is the same;
+the directives only relabel which blocks are protected.
+
+Pushing further — the same 512-block cache at the saturating experiment rate (qps 10,
+concurrency 20) — tips the on-arm into the **over-pinning collapse** the offline sim
+documents as a known failure mode[^4]: success fell to 88.7% (HTTP 504s) and throughput to
+1.7 vs 2.5 req/s, pinning ~52% of cache with no reuse gain. So the directive's effect ranges
+from inert (large cache) through neutral-but-costly (moderate pressure) to net-harmful
+(saturation) — never a win on this workload.
 
 ### 3. Non-agentic guardrail (single-shot, 300 req, qps 10)
 

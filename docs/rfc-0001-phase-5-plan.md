@@ -114,9 +114,20 @@ Design decisions locked this session:
   session_p90, zero_recompute_rate, ttft_by_turn, coverage_by_turn)` +
   `compute_program_metrics(result, block_size=16)`: pure aggregations over
   `BenchmarkResult` implementing the decisions above.
-- `src/bench/metrics.py` — `get_peak_pinned_usage(range_seconds)` and
-  `get_peak_priority_blocks(range_seconds)` via `max(max_over_time(...[Ns]))`, reusing
-  `_scalar`.
+- `src/bench/metrics.py` — `get_peak_pinned_usage(range_seconds)` via
+  `max(max_over_time(...[Ns]))`, reusing `_scalar`.
+
+**Follow-up (added after first evidence pass): cache-contention + eviction metrics.**
+The first evidence set could only *infer* eviction pressure from the pinned gauge. Added a
+`vllm:kv_cache_evictions_total` counter to the sim fork (every block evicted to make space,
+any priority — distinct from the pinned-eviction subset) plus `get_peak_cache_usage` and a
+reset-safe `get_evictions` (`increase()` over the window, since memory-limited sim pods
+OOM-restart under pressure). `bench report` gained **Cache peak %** and **Evictions**
+columns; the six parallel per-route dicts were consolidated into a `RouteReport` dataclass.
+These directly measure the contention: at a large cache both arms evict 0; under 512-block
+pressure the on-arm pins ~53% of cache yet total evictions (~2.8 k mean) and zero-recompute
+(~28%) match the off-arm within noise — confirming, not just inferring, that retention pins
+the short-gap prefixes LRU already keeps and does not reduce eviction churn.
 
 ### C. EPP route gate (Go)
 
